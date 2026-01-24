@@ -1,4 +1,23 @@
 # VPN Manager
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.7%2B-yellow.svg)]
+[![Platform](https://img.shields.io/badge/platform-linux%20%7C%20windows-lightgrey.svg)]
+
+**VpnManager** is a lightweight VPN management tool that helps you connect, configure, and control VPN connections from your system with ease.
+
+##Features
+- Manage multiple VPN configurations
+- Easy connect/disconnect UI or CLI
+- Works with OpenVPN / WireGuard (depending on implementation)
+- Cross-platform readiness
+
+## Preview
+
+### Desktop / UI Preview
+![App Screenshot](docs/screenshot.png)
+
+### CLI Example
+
 
 A professional-grade VPN management system with advanced security features, kill switch functionality, and IP rotation capabilities. Built for Linux systems requiring robust VPN connection management with enterprise-level security.
 
