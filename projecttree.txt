@@ -1,0 +1,120 @@
+.
+├── config
+│   ├── locations.json
+│   ├── settings.yaml
+│   └── vpn_profiles
+│       ├── ca-free-4.protonvpn.tcp.ovpn
+│       └── example.ovpn
+├── config.json
+├── htmlcov
+│   ├── class_index.html
+│   ├── coverage_html_cb_dd2e7eb5.js
+│   ├── favicon_32_cb_c827f16f.png
+│   ├── function_index.html
+│   ├── index.html
+│   ├── keybd_closed_cb_900cfef5.png
+│   ├── status.json
+│   ├── style_cb_9ff733b0.css
+│   ├── z_1dd5c77d52084a56___init___py.html
+│   ├── z_1dd5c77d52084a56_interface_py.html
+│   ├── z_2a633236d17ae10f___init___py.html
+│   ├── z_2a633236d17ae10f_logging_setup_py.html
+│   ├── z_2a633236d17ae10f_network_tools_py.html
+│   ├── z_2a633236d17ae10f_system_check_py.html
+│   ├── z_5f62d8e9397593cd___init___py.html
+│   ├── z_5f62d8e9397593cd__version_py.html
+│   ├── z_e288733194cd6df3___init___py.html
+│   ├── z_e288733194cd6df3_openvpn_client_py.html
+│   ├── z_e288733194cd6df3_wireguard_client_py.html
+│   ├── z_ec79b1f74f8d0c05_config_manager_py.html
+│   ├── z_ec79b1f74f8d0c05___init___py.html
+│   ├── z_ec79b1f74f8d0c05_ip_rotator_py.html
+│   ├── z_ec79b1f74f8d0c05_kill_switch_py.html
+│   ├── z_ec79b1f74f8d0c05_types_py.html
+│   └── z_ec79b1f74f8d0c05_vpn_controller_py.html
+├── LICENSE
+├── main.py
+├── projecttree.txt
+├── __pycache__
+│   ├── main.cpython-312.pyc
+│   └── setup.cpython-312.pyc
+├── pyproject.toml
+├── README.md
+├── requirements.txt
+├── scripts
+│   ├── install.sh
+│   ├── setup_env.sh
+│   └── uninstall.sh
+├── setup.py
+├── tests
+│   ├── conftest.py
+│   ├── __init__.py
+│   ├── __pycache__
+│   │   ├── conftest.cpython-312.pyc
+│   │   ├── conftest.cpython-312-pytest-9.0.2.pyc
+│   │   ├── __init__.cpython-312.pyc
+│   │   ├── test_kill_switch.cpython-312.pyc
+│   │   ├── test_kill_switch.cpython-312-pytest-9.0.2.pyc
+│   │   ├── test_network_tools.cpython-312.pyc
+│   │   ├── test_network_tools.cpython-312-pytest-9.0.2.pyc
+│   │   ├── test_openvpn_client.cpython-312.pyc
+│   │   ├── test_openvpn_client.cpython-312-pytest-9.0.2.pyc
+│   │   ├── test_vpn_controller.cpython-312.pyc
+│   │   └── test_vpn_controller.cpython-312-pytest-9.0.2.pyc
+│   ├── test_kill_switch.py
+│   ├── test_network_tools.py
+│   ├── test_openvpn_client.py
+│   └── test_vpn_controller.py
+├── vpn_manager
+│   ├── cli
+│   │   ├── __init__.py
+│   │   ├── interface.py
+│   │   └── __pycache__
+│   │       ├── __init__.cpython-312.pyc
+│   │       └── interface.cpython-312.pyc
+│   ├── core
+│   │   ├── config_manager.py
+│   │   ├── __init__.py
+│   │   ├── ip_rotator.py
+│   │   ├── kill_switch.py
+│   │   ├── __pycache__
+│   │   │   ├── config_manager.cpython-312.pyc
+│   │   │   ├── __init__.cpython-312.pyc
+│   │   │   ├── ip_rotator.cpython-312.pyc
+│   │   │   ├── kill_switch.cpython-312.pyc
+│   │   │   ├── types.cpython-312.pyc
+│   │   │   └── vpn_controller.cpython-312.pyc
+│   │   ├── types.py
+│   │   └── vpn_controller.py
+│   ├── __init__.py
+│   ├── providers
+│   │   ├── __init__.py
+│   │   ├── openvpn_client.py
+│   │   ├── __pycache__
+│   │   │   ├── __init__.cpython-312.pyc
+│   │   │   ├── openvpn_client.cpython-312.pyc
+│   │   │   └── wireguard_client.cpython-312.pyc
+│   │   └── wireguard_client.py
+│   ├── __pycache__
+│   │   ├── __init__.cpython-312.pyc
+│   │   └── _version.cpython-312.pyc
+│   ├── utils
+│   │   ├── __init__.py
+│   │   ├── logging_setup.py
+│   │   ├── network_tools.py
+│   │   ├── __pycache__
+│   │   │   ├── __init__.cpython-312.pyc
+│   │   │   ├── logging_setup.cpython-312.pyc
+│   │   │   ├── network_tools.cpython-312.pyc
+│   │   │   └── system_check.cpython-312.pyc
+│   │   └── system_check.py
+│   └── _version.py
+└── vpn_manager.egg-info
+    ├── dependency_links.txt
+    ├── entry_points.txt
+    ├── PKG-INFO
+    ├── requires.txt
+    ├── SOURCES.txt
+    └── top_level.txt
+
+19 directories, 99 files
