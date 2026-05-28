@@ -1,49 +1,7 @@
 # vpn-manager
 
-A clean Rust rewrite of the Python VPN manager — OpenVPN wrapper with an
+A Rust — OpenVPN wrapper with an
 iptables kill switch, automatic interface teardown, and a live two-tab TUI.
-
----
-
-## What was wrong with the Python version
-
-### Root bug — `persist-tun` orphans kernel routes
-
-The Python config template always emitted `persist-tun`.  When OpenVPN is
-killed (SIGKILL or an unexpected crash) this directive keeps the `tun0`
-interface alive as a kernel object.  OpenVPN had already pushed routes like:
-
-```
-0.0.0.0/1 via 10.x.x.1 dev tun0
-```
-
-Those routes remain in the routing table after the process dies.  All traffic
-is now forwarded to a dead interface.  iptables never sees the packets, so:
-
-- Restarting iptables rules → no effect (problem is in the routing layer, not netfilter)
-- `vpn-manager recover` → no effect (it only reset iptables, never touched routes/interfaces)
-- Reboot → fixes it (kernel removes the stale interface and its routes)
-
-`persist-tun` is absent from the Rust config template.
-
-### Secondary bug — explicit interface teardown was missing
-
-Neither `disconnect()` nor `force_disconnect()` in the Python code called
-`ip route flush dev tun0` or `ip link delete tun0`.  This Rust implementation
-calls `teardown_vpn_interfaces()` in every disconnect path, including the
-Drop impl (panic safety) and standalone recovery.
-
-### Kill-switch `restored` flag bug
-
-The Python `_restore_rules()` set `restored = True` on the first table that
-succeeded (`nat` often succeeds when `filter` fails), then skipped
-`_emergency_recovery()` even when the `filter` table — the one with the DROP
-default policies — had not been restored.
-
-The Rust implementation tracks per-table success independently and falls
-through to emergency recovery if any table fails.
-
----
 
 ## Installation
 
@@ -95,7 +53,7 @@ vpn-manager status
 ## TUI
 
 ```
-╭─ vpn-manager ──────────────────────────────╮
+╭─ vpn-manager ───────────────────────────────╮
 │  1 Status    2 Log                          │
 ╰─────────────────────────────────────────────╯
 
@@ -136,9 +94,7 @@ When the kill switch is active:
 
 ---
 
-## Recovery without rebooting (manual)
-
-If you're stuck right now:
+## Recovery in internet lose case
 
 ```bash
 sudo vpn-manager recover
