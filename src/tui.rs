@@ -1,8 +1,8 @@
 #![allow(deprecated)]
-/// tui.rs – two-tab TUI (ratatui 0.21 API)
-///
-/// Tab 0 – Status: connection state, server, IP, uptime, traffic, kill-switch
-/// Tab 1 – Log:    live verbose log scrollable with arrow keys / PgUp / PgDn
+//! tui.rs – two-tab TUI (ratatui 0.21 API)
+//!
+//! Tab 0 – Status: connection state, server, IP, uptime, traffic, kill-switch
+//! Tab 1 – Log:    live verbose log scrollable with arrow keys / PgUp / PgDn
 
 use std::io;
 use std::sync::mpsc::SyncSender;
@@ -191,8 +191,10 @@ fn render_status(
     let ks_label = if info.ks_active { "● ACTIVE" } else { "○ inactive" };
     let ks_color = if info.ks_active { GREEN } else { GRAY };
 
+    let proto_color = if info.protocol == "WireGuard" { AQUA } else { BLUE };
     let rows = vec![
         kv("State",      icon, sc),
+        kv("Protocol",   if info.protocol.is_empty() { "—" } else { &info.protocol }, proto_color),
         kv("Server",     &info.server_host, FG),
         kv("Location",   &format!("{}, {}", info.server_country, info.server_city), BLUE),
         kv("Public IP",  info.public_ip.as_deref().unwrap_or("—"), AQUA),
@@ -256,6 +258,8 @@ fn render_log(
                 YELLOW
             } else if line.contains("connected") || line.contains("Initialization") {
                 GREEN
+            } else if line.contains("wg-quick") || line.contains("WireGuard") {
+                AQUA
             } else if line.contains("openvpn") {
                 BLUE
             } else {

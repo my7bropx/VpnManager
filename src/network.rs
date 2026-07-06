@@ -1,9 +1,9 @@
 #![allow(dead_code)]
-/// network.rs – system-level networking operations
-///
-/// All functions here operate directly on kernel networking state via `ip`,
-/// iptables helpers, and /proc. Kept as pure functions (no global state) so
-/// they can be called from any context, including emergency paths.
+//! network.rs – system-level networking operations
+//!
+//! All functions here operate directly on kernel networking state via `ip`,
+//! iptables helpers, and /proc. Kept as pure functions (no global state) so
+//! they can be called from any context, including emergency paths.
 
 use anyhow::{Context, Result};
 use std::process::Command;
@@ -30,7 +30,7 @@ pub fn teardown_vpn_interfaces() -> Result<()> {
         })
         .filter_map(|l| {
             // "3: tun0: <..." → "tun0"
-            l.splitn(3, ':').nth(1).map(|s| s.trim().split('@').next().unwrap_or("").trim().to_string())
+            l.split(':').nth(1).map(|s| s.trim().split('@').next().unwrap_or("").trim().to_string())
         })
         .filter(|s| !s.is_empty())
         .collect();
@@ -67,7 +67,7 @@ pub fn active_vpn_interface() -> Option<String> {
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .find(|l| l.contains(": tun") || l.contains(": wg"))
-        .and_then(|l| l.splitn(3, ':').nth(1))
+        .and_then(|l| l.split(':').nth(1))
         .map(|s| s.trim().split('@').next().unwrap_or("").trim().to_string())
         .filter(|s| !s.is_empty())
 }
@@ -119,7 +119,7 @@ pub fn iface_bytes(iface: &str) -> Option<(u64, u64)> {
     for line in content.lines() {
         let trimmed = line.trim_start();
         if trimmed.starts_with(iface) && trimmed.as_bytes().get(iface.len()) == Some(&b':') {
-            let parts: Vec<&str> = trimmed.splitn(2, ':').nth(1)?.split_whitespace().collect();
+            let parts: Vec<&str> = trimmed.split_once(':')?.1.split_whitespace().collect();
             let rx = parts.first()?.parse::<u64>().ok()?;
             let tx = parts.get(8)?.parse::<u64>().ok()?;
             return Some((rx, tx));

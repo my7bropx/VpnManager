@@ -61,6 +61,7 @@ pub struct ConnInfo {
     pub connected_at:   Option<Instant>,
     pub ks_active:      bool,
     pub traffic:        Traffic,
+    pub protocol:       String,
 }
 
 // ─── Shared handles ────────────────────────────────────────────────────────────

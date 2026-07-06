@@ -1,16 +1,16 @@
 #![allow(dead_code)]
-/// openvpn.rs – OpenVPN process wrapper
-///
-/// Robustness decisions:
-///  - Preprocesses the .ovpn config to strip `daemon`, `log`, `log-append`,
-///    `persist-tun` — directives that silently break our process management
-///  - Uses `--log <tmpfile>` (not stderr pipe) as the output channel — immune
-///    to per-distro openvpn stderr buffering and config-level log overrides
-///  - Resolves the openvpn binary through common sbin paths because sudo
-///    typically strips /usr/sbin from PATH
-///  - disconnect(): SIGTERM → 10 s grace → SIGKILL, then teardown_vpn_interfaces()
-///  - force_disconnect(): SIGKILL immediately + teardown
-///  - Drop guarantees force_disconnect() even on panic
+//! openvpn.rs – OpenVPN process wrapper
+//!
+//! Robustness decisions:
+//!  - Preprocesses the .ovpn config to strip `daemon`, `log`, `log-append`,
+//!    `persist-tun` — directives that silently break our process management
+//!  - Uses `--log <tmpfile>` (not stderr pipe) as the output channel — immune
+//!    to per-distro openvpn stderr buffering and config-level log overrides
+//!  - Resolves the openvpn binary through common sbin paths because sudo
+//!    typically strips /usr/sbin from PATH
+//!  - disconnect(): SIGTERM → 10 s grace → SIGKILL, then teardown_vpn_interfaces()
+//!  - force_disconnect(): SIGKILL immediately + teardown
+//!  - Drop guarantees force_disconnect() even on panic
 
 use anyhow::{Context, Result};
 use nix::sys::signal::{kill, Signal};
@@ -138,6 +138,21 @@ impl OpenVpnProcess {
         let raw = std::fs::read_to_string(original)
             .with_context(|| format!("read config {}", original.display()))?;
 
+        // Reject WireGuard configs early with a useful message
+        let is_wireguard = raw.lines().any(|l| {
+            matches!(l.trim(), "[Interface]" | "[Peer]")
+        });
+        if is_wireguard {
+            anyhow::bail!(
+                "{} is a WireGuard config, not an OpenVPN config.\n\
+                 Use `wg-quick up {}` or a WireGuard client instead.",
+                original.display(),
+                original.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("wg0")
+            );
+        }
+
         // Directives to strip (matched as line prefix, case-insensitive)
         const STRIP: &[&str] = &[
             "daemon",        // forks openvpn — we lose process control entirely
@@ -214,10 +229,15 @@ impl OpenVpnProcess {
         }
 
         // stdin inherited → credential prompts reach the terminal
-        // stdout+stderr → null (everything goes to --log file)
+        // stdout → null (everything goes to --log file)
+        // stderr → appended to log file so early crash messages are captured
+        let stderr_sink = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+            .context("open log file for stderr")?;
         cmd.stdin(Stdio::inherit())
            .stdout(Stdio::null())
-           .stderr(Stdio::null());
+           .stderr(stderr_sink);
 
         if self.verbose {
             println!("[vpn-manager] openvpn binary : {bin}");
@@ -278,10 +298,8 @@ fn tail_log(
     loop {
         if log_path.metadata().map(|m| m.len() > 0).unwrap_or(false) { break; }
         if Instant::now() >= deadline {
-            let msg = format!(
-                "ERROR: openvpn log file empty after 5 s — binary may not exist or crashed \
-                 immediately. Check: which openvpn  or  ls /usr/sbin/openvpn"
-            );
+            let msg = "ERROR: openvpn log file empty after 5 s — binary may not exist or crashed \
+                 immediately. Check: which openvpn  or  ls /usr/sbin/openvpn".to_string();
             push_log(&ring, &msg);
             if verbose { eprintln!("{msg}"); }
             *fail_reason.lock().unwrap() = Some("openvpn did not start".into());

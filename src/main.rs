@@ -1,16 +1,17 @@
-/// main.rs – vpn-manager entry point
-///
-/// Subcommands:
-///   connect    –  start openvpn, enable kill switch, launch TUI
-///   disconnect –  graceful teardown
-///   recover    –  emergency: kill openvpn, tear down interfaces, restore iptables/DNS
-///   status     –  print current session info
+//! main.rs – vpn-manager entry point
+//!
+//! Subcommands:
+//!   connect    –  start openvpn, enable kill switch, launch TUI
+//!   disconnect –  graceful teardown
+//!   recover    –  emergency: kill openvpn, tear down interfaces, restore iptables/DNS
+//!   status     –  print current session info
 
 mod killswitch;
 mod network;
 mod openvpn;
 mod state;
 mod tui;
+mod wireguard;
 
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -28,6 +29,29 @@ use openvpn::OpenVpnProcess;
 use state::{
     log_push, new_log, new_state, ConnInfo, SessionFile, SharedState, VpnState,
 };
+use wireguard::WireGuardSession;
+
+// ─── Protocol-agnostic VPN handle ────────────────────────────────────────────
+
+enum ActiveVpn {
+    OpenVpn(Arc<Mutex<OpenVpnProcess>>),
+    WireGuard(WireGuardSession),
+}
+
+impl ActiveVpn {
+    fn disconnect(&mut self) {
+        match self {
+            Self::OpenVpn(ovpn) => ovpn.lock().unwrap().disconnect(),
+            Self::WireGuard(wg)  => wg.stop(),
+        }
+    }
+    fn as_openvpn_arc(&self) -> Option<Arc<Mutex<OpenVpnProcess>>> {
+        match self {
+            Self::OpenVpn(o) => Some(Arc::clone(o)),
+            _                => None,
+        }
+    }
+}
 
 // ─── libc for geteuid ────────────────────────────────────────────────────────
 extern "C" { fn geteuid() -> u32; }
@@ -118,8 +142,15 @@ fn main() -> Result<()> {
         Cmd::Disconnect { keep_kill_switch } => cmd_disconnect(keep_kill_switch),
 
         Cmd::Recover => {
+            // WireGuard: attempt wg-quick down so DNS is restored properly
+            let _ = std::process::Command::new("wg-quick")
+                .args(["down", wireguard::TMP_CONF])
+                .status();
+            network::kill_all_openvpn();
+            let _ = network::teardown_vpn_interfaces();
             killswitch::standalone_recovery();
             network::unlock_dns();
+            SessionFile::remove();
             println!("recovery complete");
             Ok(())
         }
@@ -130,6 +161,7 @@ fn main() -> Result<()> {
 
 // ─── connect ──────────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_connect(
     config:         Option<PathBuf>,
     host:           Option<String>,
@@ -169,12 +201,7 @@ fn cmd_connect(
     // Enabling it before openvpn connects blocks the connection itself.
     let mut ks: Option<KillSwitch> = None;
 
-    // ── Start openvpn ─────────────────────────────────────────────────────────
-    let mut ovpn = OpenVpnProcess::new(Arc::clone(&log));
-    ovpn.verbose  = verbose;
-    ovpn.log_file = log_file.clone();
-
-    // If a log file is requested, open/create it now and write a session header
+    // Optional log file header
     if let Some(ref lp) = log_file {
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(lp) {
@@ -186,72 +213,102 @@ fn cmd_connect(
         println!("logging to: {}", lp.display());
     }
     if verbose {
-        println!("[vpn-manager] verbose mode: openvpn output will appear below");
+        println!("[vpn-manager] verbose mode enabled");
         println!("[vpn-manager] kill switch: {}", if no_kill_switch { "disabled" } else { "enabled" });
     }
 
-    let start_result = if let Some(ref cfg) = config {
-        ovpn.start_with_config(cfg, auth_file.as_deref())
+    // ── Detect config type and start tunnel ───────────────────────────────────
+    let is_wg = config.as_deref()
+        .map(wireguard::is_wireguard_config)
+        .unwrap_or(false);
+
+    let (iface, mut active_vpn) = if is_wg {
+        // ── WireGuard path ────────────────────────────────────────────────────
+        let cfg = config.as_deref().unwrap(); // guarded: is_wg implies config is Some
+        println!("[vpn-manager] detected WireGuard config — using wg-quick");
+
+        let wg = WireGuardSession::start(cfg, verbose, &log)
+            .with_context(|| "wg-quick failed to bring up tunnel")?;
+
+        let iface = wg.iface.clone();
+        log_push_file(&log, &format!("WireGuard tunnel up: {iface}"), log_file.as_ref());
+        (iface, ActiveVpn::WireGuard(wg))
+
     } else {
-        ovpn.start_generic(
-            host.as_deref().unwrap_or(""),
-            port, &proto, &dns,
-            auth_file.as_deref(),
-        )
-    };
+        // ── OpenVPN path ──────────────────────────────────────────────────────
+        let mut ovpn = OpenVpnProcess::new(Arc::clone(&log));
+        ovpn.verbose  = verbose;
+        ovpn.log_file = log_file.clone();
 
-    if let Err(e) = start_result {
-        cleanup_on_failure(&mut ks);
-        return Err(e.context("start openvpn"));
-    }
+        let start_result = if let Some(ref cfg) = config {
+            ovpn.start_with_config(cfg, auth_file.as_deref())
+        } else {
+            ovpn.start_generic(
+                host.as_deref().unwrap_or(""),
+                port, &proto, &dns,
+                auth_file.as_deref(),
+            )
+        };
 
-    log_push_file(&log, "openvpn process started, waiting for tunnel...", log_file.as_ref());
-
-    // ── Wait for Initialization Sequence Completed ────────────────────────────
-    if let Err(e) = ovpn.wait_connected(Duration::from_secs(60)) {
-        ovpn.force_disconnect();
-        cleanup_on_failure(&mut ks);
-        // Always dump the tail of the log on failure so the user sees why
-        {
-            let buf = log.lock().unwrap();
-            let tail: Vec<_> = buf.iter().rev().take(40).collect::<Vec<_>>().into_iter().rev().collect();
-            if !tail.is_empty() && !verbose {
-                eprintln!("\n--- openvpn log (last {} lines) ---", tail.len());
-                for line in tail { eprintln!("{line}"); }
-                eprintln!("--- end of log ---\n");
-            }
+        if let Err(e) = start_result {
+            cleanup_on_failure(&mut ks);
+            return Err(e.context("start openvpn"));
         }
-        return Err(e.context("openvpn did not connect"));
-    }
 
-    // ── Wait for tunnel interface to appear ───────────────────────────────────
-    let iface = match wait_for_vpn_iface(15) {
-        Some(i) => i,
-        None => {
+        log_push_file(&log, "openvpn process started, waiting for tunnel...", log_file.as_ref());
+
+        if let Err(e) = ovpn.wait_connected(Duration::from_secs(60)) {
             ovpn.force_disconnect();
             cleanup_on_failure(&mut ks);
-            bail!("VPN tunnel interface never appeared after connect");
+            {
+                let buf = log.lock().unwrap();
+                let tail: Vec<_> = buf.iter().rev().take(40).collect::<Vec<_>>().into_iter().rev().collect();
+                if !tail.is_empty() && !verbose {
+                    eprintln!("\n--- openvpn log (last {} lines) ---", tail.len());
+                    for line in tail { eprintln!("{line}"); }
+                    eprintln!("--- end of log ---\n");
+                }
+            }
+            return Err(e.context("openvpn did not connect"));
         }
+
+        let iface = match wait_for_vpn_iface(15) {
+            Some(i) => i,
+            None => {
+                ovpn.force_disconnect();
+                cleanup_on_failure(&mut ks);
+                bail!("VPN tunnel interface never appeared after connect");
+            }
+        };
+
+        log_push_file(&log, &format!("tunnel interface: {iface}"), log_file.as_ref());
+        (iface, ActiveVpn::OpenVpn(Arc::new(Mutex::new(ovpn))))
     };
 
-    log_push(&log, &format!("tunnel interface: {iface}"));
+    log_push(&log, format!("tunnel interface: {iface}"));
 
     // ── Kill switch – enabled NOW, after tunnel is up ─────────────────────────
-    // The tunnel interface exists, so all legitimate traffic routes through it.
-    // Enabling the kill switch here means: if the tunnel drops unexpectedly,
-    // traffic is blocked rather than leaking over the physical interface.
     if !no_kill_switch {
         log_push_file(&log, "enabling kill switch (tunnel is up)", log_file.as_ref());
         let mut k = KillSwitch::new();
-        // At this point the interface is real; add it explicitly
-        if let Some(ref h) = host {
+
+        if is_wg {
+            // Parse endpoints and DNS from the WireGuard config
+            let cfg = config.as_deref().unwrap();
+            for (h, p, pr) in wireguard::parse_endpoints(cfg) {
+                k.add_server(&h, &pr, p);
+            }
+            let wg_dns = wireguard::parse_dns(cfg);
+            for d in &wg_dns { k.add_dns(d); }
+        } else if let Some(ref h) = host {
             k.add_server(h, &proto, port);
         } else if let Some(ref cfg) = config {
             for (h, p, pr) in extract_remotes_from_config(cfg) {
                 k.add_server(&h, &pr, p);
             }
+            for d in &dns { k.add_dns(d); }
         }
-        for d in &dns { k.add_dns(d); }
+
         match k.enable() {
             Ok(()) => {
                 set_vpn_state(&shared, VpnState::Connected, |i| i.ks_active = true);
@@ -259,15 +316,16 @@ fn cmd_connect(
                 ks = Some(k);
             }
             Err(e) => {
-                log_push(&log, &format!("WARN: kill switch failed to enable: {e}"));
-                // Continue without kill switch rather than leaving user disconnected
+                log_push(&log, format!("WARN: kill switch failed to enable: {e}"));
             }
         }
     }
 
-    // ── Lock DNS ───────────────────────────────────────────────────────────────
-    if let Err(e) = network::lock_dns(&dns, &iface) {
-        log_push(&log, &format!("WARN: DNS lock failed: {e}"));
+    // ── Lock DNS (OpenVPN only – wg-quick manages DNS for WireGuard) ──────────
+    if !is_wg {
+        if let Err(e) = network::lock_dns(&dns, &iface) {
+            log_push(&log, format!("WARN: DNS lock failed: {e}"));
+        }
     }
 
     // ── Public IP + geo ────────────────────────────────────────────────────────
@@ -286,9 +344,10 @@ fn cmd_connect(
         i.server_country = country.clone();
         i.server_city    = city.clone();
         i.connected_at   = Some(connected_at);
+        i.protocol       = if is_wg { "WireGuard".into() } else { "OpenVPN".into() };
     });
 
-    log_push(&log, &format!(
+    log_push(&log, format!(
         "connected  ip={}  location={city}, {country}  iface={iface}",
         public_ip.as_deref().unwrap_or("?")
     ));
@@ -310,14 +369,13 @@ fn cmd_connect(
     }.write();
 
     // ── Monitor thread ────────────────────────────────────────────────────────
-    let ovpn_arc = Arc::new(Mutex::new(ovpn));
     let (stop_tx, stop_rx) = mpsc::sync_channel::<()>(1);
+    let mon_ovpn = active_vpn.as_openvpn_arc(); // None for WireGuard
 
     {
         let mon_shared = Arc::clone(&shared);
         let mon_log    = Arc::clone(&log);
         let mon_iface  = iface.clone();
-        let mon_ovpn   = Arc::clone(&ovpn_arc);
 
         thread::Builder::new()
             .name("vpn-monitor".into())
@@ -330,7 +388,6 @@ fn cmd_connect(
     if !no_tui {
         tui::run(Arc::clone(&shared), Arc::clone(&log), stop_for_tui)?;
     } else {
-        // Block until Ctrl-C (SIGINT handled below)
         println!("running in background  (Ctrl-C to disconnect)");
         let _ = stop_tx.send(());
     }
@@ -339,13 +396,11 @@ fn cmd_connect(
     println!("disconnecting...");
     set_vpn_state(&shared, VpnState::Disconnecting, |_| {});
 
-    {
-        let mut g = ovpn_arc.lock().unwrap();
-        g.disconnect();
-    }
+    active_vpn.disconnect();
 
     if let Some(ref mut k) = ks { k.disable(); }
-    network::unlock_dns();
+    // wg-quick restores DNS on `down`; only call unlock_dns for OpenVPN
+    if !is_wg { network::unlock_dns(); }
 
     set_vpn_state(&shared, VpnState::Disconnected, |i| {
         i.ks_active    = false;
@@ -379,6 +434,10 @@ fn cmd_disconnect(keep_kill_switch: bool) -> Result<()> {
     // Safety net: clean up even if the manager already died
     if SessionFile::read().is_some() || network::active_vpn_interface().is_some() {
         println!("forcing cleanup...");
+        // Try wg-quick down first so DNS is properly restored for WireGuard
+        let _ = std::process::Command::new("wg-quick")
+            .args(["down", wireguard::TMP_CONF])
+            .status();
         network::kill_all_openvpn();
         let _ = network::teardown_vpn_interfaces();
         if !keep_kill_switch {
@@ -436,20 +495,19 @@ fn monitor_loop(
     shared:  SharedState,
     log:     state::LogBuf,
     iface:   String,
-    ovpn:    Arc<Mutex<OpenVpnProcess>>,
+    ovpn:    Option<Arc<Mutex<OpenVpnProcess>>>,
     stop_rx: mpsc::Receiver<()>,
 ) {
     let mut last_traffic      = Instant::now();
     let mut last_ip_check     = Instant::now();
     let mut last_route_check  = Instant::now();
-    // Track consecutive route-miss count to avoid log spam
     let mut route_miss_count  = 0u32;
 
     loop {
         if stop_rx.try_recv().is_ok() { break; }
 
-        // Openvpn process health
-        {
+        // OpenVPN process health (skipped for WireGuard — route check covers it)
+        if let Some(ref ovpn) = ovpn {
             let mut g = ovpn.lock().unwrap();
             if !g.is_alive() {
                 log_push(&log, "ERROR: openvpn process died unexpectedly");
@@ -481,8 +539,8 @@ fn monitor_loop(
             if !network::default_route_is_vpn(&iface) {
                 route_miss_count += 1;
                 // Log on first miss, then only every 5th to avoid spam
-                if route_miss_count == 1 || route_miss_count % 5 == 0 {
-                    log_push(&log, &format!(
+                if route_miss_count == 1 || route_miss_count.is_multiple_of(5) {
+                    log_push(&log, format!(
                         "WARN: default route not through VPN tunnel (miss #{})", route_miss_count
                     ));
                 }

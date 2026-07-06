@@ -1,12 +1,12 @@
 #![allow(dead_code)]
-/// killswitch.rs – iptables-based kill switch
-///
-/// Fixes over the Python original:
-///  1. restore_rules() tracks per-table success independently – no short-circuit
-///     on the first success of any table (the "restored" flag bug).
-///  2. emergency_recovery() tears down VPN interfaces in addition to
-///     resetting iptables.
-///  3. KillSwitch implements Drop, so iptables are always restored even on panic.
+//! killswitch.rs – iptables-based kill switch
+//!
+//! Fixes over the Python original:
+//!  1. restore_rules() tracks per-table success independently – no short-circuit
+//!     on the first success of any table (the "restored" flag bug).
+//!  2. emergency_recovery() tears down VPN interfaces in addition to
+//!     resetting iptables.
+//!  3. KillSwitch implements Drop, so iptables are always restored even on panic.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
