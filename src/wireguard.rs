@@ -16,13 +16,20 @@ const WG_IFACE: &str = "wgvpnm";
 pub struct WireGuardSession {
     tmp_conf: PathBuf,
     pub iface: String,
+    stopped:  bool,
 }
 
 impl WireGuardSession {
     pub fn start(config: &Path, verbose: bool, log: &LogBuf) -> Result<Self> {
-        // Copy to a fixed short name so the derived interface name stays ≤15 chars
-        std::fs::copy(config, TMP_CONF)
-            .context("copy WireGuard config to /tmp/wgvpnm.conf")?;
+        // Copy to a fixed short name so the derived interface name stays ≤15 chars.
+        // Normalise on the way: strip a UTF-8 BOM and Windows line endings —
+        // wg rejects a key with a trailing \r as "Key is not the correct
+        // length or format".
+        let raw = std::fs::read_to_string(config)
+            .with_context(|| format!("read WireGuard config {}", config.display()))?;
+        let cleaned = raw.trim_start_matches('\u{feff}').replace('\r', "");
+        std::fs::write(TMP_CONF, cleaned)
+            .context("write WireGuard config to /tmp/wgvpnm.conf")?;
 
         // 600 — the config holds the private key, and wg-quick warns
         // "world accessible" otherwise
@@ -63,6 +70,7 @@ impl WireGuardSession {
         Ok(Self {
             tmp_conf: PathBuf::from(TMP_CONF),
             iface:    WG_IFACE.to_string(),
+            stopped:  false,
         })
     }
 
@@ -71,13 +79,17 @@ impl WireGuardSession {
             .args(["down", self.tmp_conf.to_str().unwrap_or(TMP_CONF)])
             .status();
         let _ = std::fs::remove_file(&self.tmp_conf);
+        self.stopped = true;
     }
 
 }
 
 impl Drop for WireGuardSession {
     fn drop(&mut self) {
-        // Best-effort teardown; errors ignored since we're in a destructor
+        // Best-effort teardown; errors ignored since we're in a destructor.
+        // Skipped after stop() — running wg-quick down twice just prints
+        // "`/tmp/wgvpnm.conf' does not exist" noise.
+        if self.stopped { return; }
         let _ = Command::new("wg-quick")
             .args(["down", self.tmp_conf.to_str().unwrap_or(TMP_CONF)])
             .status();
@@ -86,6 +98,57 @@ impl Drop for WireGuardSession {
 }
 
 // ─── Config inspection ────────────────────────────────────────────────────────
+
+/// A WireGuard key is 32 bytes base64-encoded: exactly 44 chars ending in '='.
+fn is_valid_wg_key(s: &str) -> bool {
+    s.len() == 44
+        && s.ends_with('=')
+        && s[..43].bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+}
+
+/// Sanity-check a WireGuard config without touching the network.
+/// Catches the classic failure modes before we tear down a working tunnel:
+/// placeholder keys (a config copy-pasted from a provider page shows the
+/// private key masked as "*****"), truncated keys, and missing sections.
+pub fn validate_config(path: &Path) -> Result<(), String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+
+    let mut private_key: Option<String> = None;
+    let mut has_endpoint = false;
+
+    for line in text.lines() {
+        let t = line.trim();
+        let lower = t.to_ascii_lowercase();
+        if lower.starts_with("privatekey") {
+            if let Some((_, v)) = t.split_once('=') {
+                private_key = Some(v.trim().to_string());
+            }
+        } else if lower.starts_with("endpoint") && t.contains('=') {
+            has_endpoint = true;
+        }
+    }
+
+    match private_key {
+        None => return Err("no PrivateKey in the [Interface] section".into()),
+        Some(k) if k.contains('*') => {
+            return Err("PrivateKey is a masked placeholder (\"*****\") — \
+                        re-download the config from your VPN provider".into());
+        }
+        Some(k) if !is_valid_wg_key(&k) => {
+            return Err(format!(
+                "PrivateKey is not a valid WireGuard key ({} chars, expected 44 base64 chars)",
+                k.len()
+            ));
+        }
+        Some(_) => {}
+    }
+
+    if !has_endpoint {
+        return Err("no Endpoint in any [Peer] section".into());
+    }
+    Ok(())
+}
 
 pub fn is_wireguard_config(path: &Path) -> bool {
     std::fs::read_to_string(path)

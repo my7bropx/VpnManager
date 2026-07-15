@@ -54,6 +54,18 @@ pub fn scan(dir: &Path) -> Vec<ConfigEntry> {
     out
 }
 
+/// Sanity-check a config before connecting (or switching) to it.
+/// Returns a human-readable reason when the file can't work.
+pub fn validate(path: &Path) -> Result<(), String> {
+    if wireguard::is_wireguard_config(path) {
+        wireguard::validate_config(path)
+    } else if extract_remotes_from_config(path).is_empty() {
+        Err("no `remote` directive found — not a usable OpenVPN profile".into())
+    } else {
+        Ok(())
+    }
+}
+
 /// First `remote <host>` from an .ovpn file.
 pub fn extract_remote_from_config(path: &Path) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;

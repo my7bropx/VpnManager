@@ -29,7 +29,7 @@ use ratatui::{
 };
 
 use crate::configs::{self, ConfigEntry};
-use crate::state::{human_bytes, human_rate, hms, LogBuf, SharedState, VpnState};
+use crate::state::{human_bytes, human_rate, hms, log_push, LogBuf, SharedState, VpnState};
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
@@ -164,9 +164,22 @@ pub fn run(
                 (KeyCode::Enter, _) if tab == 2 => {
                     if let Some(e) = cfg_entries.get(cfg_sel) {
                         if !picker.is_current(&e.path) {
-                            let _ = stop_tx.try_send(());
-                            action = TuiAction::Switch(e.path.clone());
-                            break;
+                            // Validate BEFORE tearing down the working tunnel —
+                            // a broken config (placeholder key, no remote…)
+                            // should not cost the current connection.
+                            match configs::validate(&e.path) {
+                                Ok(()) => {
+                                    let _ = stop_tx.try_send(());
+                                    action = TuiAction::Switch(e.path.clone());
+                                    break;
+                                }
+                                Err(msg) => {
+                                    log_push(&log_buf, format!(
+                                        "ERROR: not switching to {}: {msg}", e.name
+                                    ));
+                                    tab = 1; // show the log so the reason is visible
+                                }
+                            }
                         }
                     }
                 }

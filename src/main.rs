@@ -205,6 +205,14 @@ fn cmd_connect(
         }
     }
 
+    // Catch obviously broken configs (placeholder keys, no remote) up front —
+    // before the root check, so it doesn't even need sudo to tell you
+    if let Some(ref cfg) = config {
+        if let Err(msg) = configs::validate(cfg) {
+            bail!("invalid config {}: {msg}", cfg.display());
+        }
+    }
+
     if unsafe { geteuid() } != 0 {
         bail!("vpn-manager connect must be run as root (sudo)");
     }
@@ -232,17 +240,38 @@ fn cmd_connect(
 
     // ── Session loop: TUI can exit with "switch to another config" ────────────
     let mut current_config = config;
+    let mut prev_config: Option<PathBuf> = None;
 
     loop {
-        let mut session = start_session(
-            current_config.as_deref(),
+        let start = |cfg: Option<&Path>| start_session(
+            cfg,
             host.as_deref(),
             port, &proto, &dns,
             auth_file.as_deref(),
             no_kill_switch, no_tui, verbose,
             log_file.as_ref(),
             &shared, &log,
-        )?;
+        );
+
+        let mut session = match start(current_config.as_deref()) {
+            Ok(s) => s,
+            // A switch target that validated can still fail to connect
+            // (auth, unreachable endpoint…) — fall back to the config that
+            // was working a moment ago instead of exiting disconnected.
+            Err(e) => match prev_config.take() {
+                Some(prev) => {
+                    eprintln!("✗ connect failed: {e:#}");
+                    log_push_file(&log, &format!(
+                        "ERROR: connect failed ({e:#}); reconnecting to previous config {}",
+                        prev.display()
+                    ), log_file.as_ref());
+                    println!("reconnecting to previous config {}...", prev.display());
+                    current_config = Some(prev);
+                    start(current_config.as_deref())?
+                }
+                None => return Err(e),
+            },
+        };
 
         let action = if !no_tui {
             let picker = ConfigPicker {
@@ -267,6 +296,7 @@ fn cmd_connect(
             TuiAction::Switch(p) => {
                 log_push_file(&log, &format!("switching to {}", p.display()), log_file.as_ref());
                 println!("switching to {}...", p.display());
+                prev_config    = current_config.take();
                 current_config = Some(p);
             }
         }
