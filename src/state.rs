@@ -26,6 +26,9 @@ impl VpnState {
     }
 }
 
+/// How many rate samples (~1 per second) the dashboard sparklines keep.
+pub const RATE_HISTORY: usize = 300;
+
 #[derive(Debug, Clone, Default)]
 pub struct Traffic {
     pub bytes_sent:    u64,
@@ -33,6 +36,9 @@ pub struct Traffic {
     pub upload_bps:    f64,
     pub download_bps:  f64,
     pub last_sample:   Option<(Instant, u64, u64)>, // (time, sent, recv)
+    /// Rate history (bytes/s, one sample per update) for the dashboard sparklines
+    pub up_history:    VecDeque<u64>,
+    pub down_history:  VecDeque<u64>,
 }
 
 impl Traffic {
@@ -43,11 +49,18 @@ impl Traffic {
             let elapsed = t.elapsed().as_secs_f64().max(0.001);
             self.upload_bps   = (new_sent.saturating_sub(ps)) as f64 / elapsed;
             self.download_bps = (new_recv.saturating_sub(pr)) as f64 / elapsed;
+            push_capped(&mut self.up_history,   self.upload_bps   as u64);
+            push_capped(&mut self.down_history, self.download_bps as u64);
         }
         self.bytes_sent  = new_sent;
         self.bytes_recv  = new_recv;
         self.last_sample = Some((now, new_sent, new_recv));
     }
+}
+
+fn push_capped(h: &mut VecDeque<u64>, v: u64) {
+    if h.len() >= RATE_HISTORY { h.pop_front(); }
+    h.push_back(v);
 }
 
 #[derive(Debug, Clone, Default)]

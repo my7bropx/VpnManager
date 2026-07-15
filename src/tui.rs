@@ -1,9 +1,13 @@
 #![allow(deprecated)]
 //! tui.rs – three-tab TUI (ratatui 0.21 API)
 //!
-//! Tab 0 – Status:  connection state, server, IP, uptime, traffic, kill-switch
-//! Tab 1 – Log:     live verbose log scrollable with arrow keys / PgUp / PgDn
-//! Tab 2 – Configs: config files next to the active one; Enter switches VPN
+//! Tab 0 – Dashboard: colour-coded state banner, connection + traffic panels,
+//!                    live upload/download sparklines (1 s samples)
+//! Tab 1 – Log:       live verbose log scrollable with arrow keys / PgUp / PgDn
+//! Tab 2 – Configs:   config files next to the active one; Enter switches VPN
+//!
+//! Rendering style: everything that shows text is a Paragraph of styled Spans
+//! (the only non-Paragraph widgets are the Tabs bar and the two Sparklines).
 
 use std::io;
 use std::path::PathBuf;
@@ -20,7 +24,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Span, Spans},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Tabs, Wrap},
+    widgets::{Block, Borders, Paragraph, Sparkline, Tabs, Wrap},
     Frame, Terminal,
 };
 
@@ -73,6 +77,18 @@ const ORANGE: Color = Color::Rgb(214, 93,  14);
 const GRAY:   Color = Color::Rgb(146, 131, 116);
 
 const TAB_COUNT: usize = 3;
+
+/// State → (colour, banner icon+label). One source of truth so every widget
+/// is colour-coded the same way.
+fn state_style(vs: &VpnState) -> (Color, &'static str) {
+    match vs {
+        VpnState::Connected    => (GREEN,  "● CONNECTED"),
+        VpnState::Connecting   => (YELLOW, "◌ CONNECTING"),
+        VpnState::Disconnected => (GRAY,   "○ DISCONNECTED"),
+        VpnState::Error(_)     => (RED,    "✗ ERROR"),
+        _                      => (ORANGE, "◎ BUSY"),
+    }
+}
 
 // ─── Public entry ─────────────────────────────────────────────────────────────
 
@@ -186,10 +202,12 @@ fn render(
         ])
         .split(f.size());
 
-    render_tab_bar(f, rows[0], tab);
+    // Border colour of the tab bar follows the connection state
+    let state_color = { state_style(&state.lock().unwrap().0).0 };
+    render_tab_bar(f, rows[0], tab, state_color);
 
     match tab {
-        0 => render_status(f, rows[1], state),
+        0 => render_dashboard(f, rows[1], state),
         1 => render_log(f,    rows[1], log_buf, log_off),
         2 => render_configs(f, rows[1], cfg_entries, cfg_sel, picker),
         _ => {}
@@ -201,15 +219,16 @@ fn render(
 // ─── Tab bar ─────────────────────────────────────────────────────────────────
 
 fn render_tab_bar(
-    f:    &mut Frame<CrosstermBackend<io::Stdout>>,
-    area: Rect,
-    sel:  usize,
+    f:           &mut Frame<CrosstermBackend<io::Stdout>>,
+    area:        Rect,
+    sel:         usize,
+    state_color: Color,
 ) {
     let titles = vec![
         Spans::from(vec![
             Span::raw("  "),
             Span::styled("1", Style::default().fg(YELLOW)),
-            Span::raw(" Status  "),
+            Span::raw(" Dashboard  "),
         ]),
         Spans::from(vec![
             Span::raw("  "),
@@ -231,7 +250,7 @@ fn render_tab_bar(
                     " vpn-manager ",
                     Style::default().fg(AQUA).add_modifier(Modifier::BOLD),
                 ))
-                .border_style(Style::default().fg(GRAY)),
+                .border_style(Style::default().fg(state_color)),
         )
         .select(sel)
         .style(Style::default().fg(FG))
@@ -245,9 +264,9 @@ fn render_tab_bar(
     f.render_widget(tabs, area);
 }
 
-// ─── Status tab ───────────────────────────────────────────────────────────────
+// ─── Dashboard tab ────────────────────────────────────────────────────────────
 
-fn render_status(
+fn render_dashboard(
     f:     &mut Frame<CrosstermBackend<io::Stdout>>,
     area:  Rect,
     state: &SharedState,
@@ -257,28 +276,12 @@ fn render_status(
         (g.0.clone(), g.1.clone())
     };
 
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area);
+    let (sc, icon) = state_style(&vpn_state);
+    let proto_color = if info.protocol == "WireGuard" { AQUA } else { BLUE };
 
-    // ── Left: connection info ────────────────────────────────────────────────
     let uptime = info.connected_at
         .map(|t| hms(t.elapsed().as_secs()))
         .unwrap_or_else(|| "—".into());
-
-    let (sc, icon) = match &vpn_state {
-        VpnState::Connected    => (GREEN,  "● CONNECTED"),
-        VpnState::Connecting   => (YELLOW, "◌ CONNECTING"),
-        VpnState::Disconnected => (GRAY,   "○ DISCONNECTED"),
-        VpnState::Error(_)     => (RED,    "✗ ERROR"),
-        _                      => (ORANGE, "◎ BUSY"),
-    };
-
-    let ks_label = if info.ks_active { "● ACTIVE" } else { "○ inactive" };
-    let ks_color = if info.ks_active { GREEN } else { GRAY };
-
-    let proto_color = if info.protocol == "WireGuard" { AQUA } else { BLUE };
 
     // City, Country — matches the log format; placeholder until the
     // background geo lookup finishes
@@ -291,7 +294,54 @@ fn render_status(
         if vpn_state == VpnState::Connected { "resolving..." } else { "—" }
     );
 
-    let rows = vec![
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),  // banner
+            Constraint::Min(8),     // connection + traffic panels
+            Constraint::Length(6),  // sparklines
+        ])
+        .split(area);
+
+    // ── Banner: one colour-coded line with the essentials ────────────────────
+    let sep = || Span::styled("  ·  ", Style::default().fg(GRAY));
+    let mut banner = vec![
+        Span::raw(" "),
+        Span::styled(icon, Style::default().fg(sc).add_modifier(Modifier::BOLD)),
+    ];
+    if !info.protocol.is_empty() {
+        banner.push(sep());
+        banner.push(Span::styled(info.protocol.clone(), Style::default().fg(proto_color)));
+    }
+    if let VpnState::Error(e) = &vpn_state {
+        banner.push(sep());
+        banner.push(Span::styled(e.clone(), Style::default().fg(RED)));
+    } else {
+        banner.push(sep());
+        banner.push(Span::styled(public_ip.to_string(), Style::default().fg(AQUA)));
+        banner.push(sep());
+        banner.push(Span::styled(location.clone(), Style::default().fg(BLUE)));
+        banner.push(sep());
+        banner.push(Span::styled(format!("up {uptime}"), Style::default().fg(YELLOW)));
+    }
+
+    let banner_p = Paragraph::new(Spans::from(banner))
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(sc)))
+        .alignment(Alignment::Left);
+    f.render_widget(banner_p, rows[0]);
+
+    // ── Panels: connection (left) + traffic totals (right) ───────────────────
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(rows[1]);
+
+    let ks_label = if info.ks_active { "● ACTIVE" } else { "○ inactive" };
+    let ks_color = if info.ks_active { GREEN } else { GRAY };
+
+    let conn_rows = vec![
         kv("State",      icon, sc),
         kv("Protocol",   if info.protocol.is_empty() { "—" } else { &info.protocol }, proto_color),
         kv("Server",     &info.server_host, FG),
@@ -304,7 +354,7 @@ fn render_status(
         kv("DNS",        &info.dns_servers.join("  "), FG),
     ];
 
-    let conn = Paragraph::new(rows)
+    let conn = Paragraph::new(conn_rows)
         .block(Block::default()
             .borders(Borders::ALL)
             .title(Span::styled(" Connection ", Style::default().fg(BLUE)))
@@ -312,7 +362,6 @@ fn render_status(
         .wrap(Wrap { trim: true });
     f.render_widget(conn, cols[0]);
 
-    // ── Right: traffic ────────────────────────────────────────────────────────
     let t = &info.traffic;
     let traffic_rows = vec![
         blank(),
@@ -329,6 +378,45 @@ fn render_status(
             .title(Span::styled(" Traffic ", Style::default().fg(BLUE)))
             .border_style(Style::default().fg(GRAY)));
     f.render_widget(traf, cols[1]);
+
+    // ── Live sparklines: last N seconds of rates ──────────────────────────────
+    let sparks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(rows[2]);
+
+    render_rate_spark(f, sparks[0], "↑", &t.up_history,   t.upload_bps,   ORANGE);
+    render_rate_spark(f, sparks[1], "↓", &t.down_history, t.download_bps, AQUA);
+}
+
+fn render_rate_spark(
+    f:       &mut Frame<CrosstermBackend<io::Stdout>>,
+    area:    Rect,
+    arrow:   &str,
+    history: &std::collections::VecDeque<u64>,
+    current: f64,
+    color:   Color,
+) {
+    let width = area.width.saturating_sub(2) as usize;
+    let n     = history.len().min(width);
+    let data: Vec<u64> = history.iter().skip(history.len() - n).copied().collect();
+    let peak  = history.iter().copied().max().unwrap_or(0);
+
+    let title = format!(
+        " {arrow} {}   peak {} ",
+        human_rate(current),
+        human_rate(peak as f64),
+    );
+
+    let spark = Sparkline::default()
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled(title, Style::default().fg(color)))
+            .border_style(Style::default().fg(GRAY)))
+        .data(&data)
+        .style(Style::default().fg(color));
+
+    f.render_widget(spark, area);
 }
 
 // ─── Log tab ─────────────────────────────────────────────────────────────────
@@ -346,7 +434,7 @@ fn render_log(
     let start    = total.saturating_sub(inner_h + skip);
     let end      = (start + inner_h).min(total);
 
-    let items: Vec<ListItem> = buf
+    let lines: Vec<Spans> = buf
         .range(start..end)
         .map(|line| {
             let color = if line.contains("ERROR") || line.contains("failed") {
@@ -364,7 +452,16 @@ fn render_log(
             } else {
                 FG
             };
-            ListItem::new(Spans::from(Span::styled(line.clone(), Style::default().fg(color))))
+
+            // Dim the "[hh:mm:ss] " timestamp prefix, colour the message
+            if let Some(rest) = line.strip_prefix('[').and_then(|r| r.split_once("] ")) {
+                Spans::from(vec![
+                    Span::styled(format!("[{}] ", rest.0), Style::default().fg(GRAY)),
+                    Span::styled(rest.1.to_string(), Style::default().fg(color)),
+                ])
+            } else {
+                Spans::from(Span::styled(line.clone(), Style::default().fg(color)))
+            }
         })
         .collect();
 
@@ -374,13 +471,13 @@ fn render_log(
         " Log (live) ".into()
     };
 
-    let list = List::new(items)
+    let p = Paragraph::new(lines)
         .block(Block::default()
             .borders(Borders::ALL)
             .title(Span::styled(title, Style::default().fg(BLUE)))
             .border_style(Style::default().fg(GRAY)));
 
-    f.render_widget(list, area);
+    f.render_widget(p, area);
 }
 
 // ─── Configs tab ─────────────────────────────────────────────────────────────
@@ -418,7 +515,7 @@ fn render_configs(
     let inner_h = area.height.saturating_sub(2) as usize;
     let start = if inner_h == 0 || sel < inner_h { 0 } else { sel + 1 - inner_h };
 
-    let items: Vec<ListItem> = entries
+    let lines: Vec<Spans> = entries
         .iter()
         .enumerate()
         .skip(start)
@@ -435,17 +532,17 @@ fn render_configs(
                 row_prefix = row_prefix.add_modifier(Modifier::REVERSED);
             }
 
-            ListItem::new(Spans::from(vec![
+            Spans::from(vec![
                 Span::styled(marker.to_string(), row_prefix),
                 Span::styled(format!("{:<36}", e.name), name_style),
                 Span::styled(format!(" {:<10}", e.kind), Style::default().fg(kind_color)),
                 Span::styled(format!(" {}", e.server), Style::default().fg(GRAY)),
-            ]))
+            ])
         })
         .collect();
 
-    let list = List::new(items).block(block);
-    f.render_widget(list, area);
+    let p = Paragraph::new(lines).block(block);
+    f.render_widget(p, area);
 }
 
 // ─── Help bar ─────────────────────────────────────────────────────────────────
