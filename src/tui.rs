@@ -1,10 +1,12 @@
 #![allow(deprecated)]
-//! tui.rs – two-tab TUI (ratatui 0.21 API)
+//! tui.rs – three-tab TUI (ratatui 0.21 API)
 //!
-//! Tab 0 – Status: connection state, server, IP, uptime, traffic, kill-switch
-//! Tab 1 – Log:    live verbose log scrollable with arrow keys / PgUp / PgDn
+//! Tab 0 – Status:  connection state, server, IP, uptime, traffic, kill-switch
+//! Tab 1 – Log:     live verbose log scrollable with arrow keys / PgUp / PgDn
+//! Tab 2 – Configs: config files next to the active one; Enter switches VPN
 
 use std::io;
+use std::path::PathBuf;
 use std::sync::mpsc::SyncSender;
 use std::time::{Duration, Instant};
 
@@ -22,7 +24,41 @@ use ratatui::{
     Frame, Terminal,
 };
 
+use crate::configs::{self, ConfigEntry};
 use crate::state::{human_bytes, human_rate, hms, LogBuf, SharedState, VpnState};
+
+// ─── Public types ─────────────────────────────────────────────────────────────
+
+/// What the user chose when the TUI exited.
+pub enum TuiAction {
+    /// Disconnect and quit
+    Quit,
+    /// Disconnect, then reconnect using this config file
+    Switch(PathBuf),
+}
+
+/// Where to look for sibling configs and which one is active.
+pub struct ConfigPicker {
+    pub dir:     Option<PathBuf>,
+    pub current: Option<PathBuf>,
+}
+
+impl ConfigPicker {
+    fn scan(&self) -> Vec<ConfigEntry> {
+        self.dir.as_deref().map(configs::scan).unwrap_or_default()
+    }
+
+    fn is_current(&self, path: &std::path::Path) -> bool {
+        match &self.current {
+            None => false,
+            Some(cur) => {
+                let a = std::fs::canonicalize(cur).unwrap_or_else(|_| cur.clone());
+                let b = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+                a == b
+            }
+        }
+    }
+}
 
 // ─── Gruvbox palette ─────────────────────────────────────────────────────────
 #[allow(dead_code)]
@@ -36,13 +72,16 @@ const AQUA:   Color = Color::Rgb(104, 157, 106);
 const ORANGE: Color = Color::Rgb(214, 93,  14);
 const GRAY:   Color = Color::Rgb(146, 131, 116);
 
+const TAB_COUNT: usize = 3;
+
 // ─── Public entry ─────────────────────────────────────────────────────────────
 
 pub fn run(
     state:   SharedState,
     log_buf: LogBuf,
     stop_tx: SyncSender<()>,
-) -> anyhow::Result<()> {
+    picker:  ConfigPicker,
+) -> anyhow::Result<TuiAction> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -51,11 +90,24 @@ pub fn run(
 
     let mut tab     = 0usize;
     let mut log_off = 0usize;
-    let mut last    = Instant::now();
+    let mut action  = TuiAction::Quit;
+
+    // Config list state (rescanned every time the tab is entered)
+    let mut cfg_entries: Vec<ConfigEntry> = Vec::new();
+    let mut cfg_sel = 0usize;
+
+    let enter_configs_tab = |entries: &mut Vec<ConfigEntry>, sel: &mut usize| {
+        *entries = picker.scan();
+        if *sel >= entries.len() { *sel = entries.len().saturating_sub(1); }
+    };
+
+    // First frame right away — don't sit on a blank alternate screen
+    term.draw(|f| render(f, &state, &log_buf, tab, log_off, &cfg_entries, cfg_sel, &picker))?;
+    let mut last = Instant::now();
 
     loop {
         if last.elapsed() >= Duration::from_millis(100) {
-            term.draw(|f| render(f, &state, &log_buf, tab, log_off))?;
+            term.draw(|f| render(f, &state, &log_buf, tab, log_off, &cfg_entries, cfg_sel, &picker))?;
             last = Instant::now();
         }
 
@@ -69,14 +121,39 @@ pub fn run(
                     let _ = stop_tx.try_send(());
                     break;
                 }
-                (KeyCode::Tab, _)        => { tab = (tab + 1) % 2; log_off = 0; }
+                (KeyCode::Tab, _) => {
+                    tab = (tab + 1) % TAB_COUNT;
+                    log_off = 0;
+                    if tab == 2 { enter_configs_tab(&mut cfg_entries, &mut cfg_sel); }
+                }
                 (KeyCode::Char('1'), _)  => { tab = 0; }
                 (KeyCode::Char('2'), _)  => { tab = 1; }
+                (KeyCode::Char('3'), _)  => {
+                    tab = 2;
+                    enter_configs_tab(&mut cfg_entries, &mut cfg_sel);
+                }
+
+                // Log tab scrolling
                 (KeyCode::Up,     _) if tab == 1 => { log_off = log_off.saturating_add(1); }
                 (KeyCode::Down,   _) if tab == 1 => { log_off = log_off.saturating_sub(1); }
                 (KeyCode::PageUp, _) if tab == 1 => { log_off = log_off.saturating_add(20); }
                 (KeyCode::PageDown,_) if tab == 1 => { log_off = log_off.saturating_sub(20); }
                 (KeyCode::End,    _) if tab == 1 => { log_off = 0; }
+
+                // Configs tab selection
+                (KeyCode::Up,   _) if tab == 2 => { cfg_sel = cfg_sel.saturating_sub(1); }
+                (KeyCode::Down, _) if tab == 2 => {
+                    if cfg_sel + 1 < cfg_entries.len() { cfg_sel += 1; }
+                }
+                (KeyCode::Enter, _) if tab == 2 => {
+                    if let Some(e) = cfg_entries.get(cfg_sel) {
+                        if !picker.is_current(&e.path) {
+                            let _ = stop_tx.try_send(());
+                            action = TuiAction::Switch(e.path.clone());
+                            break;
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -84,17 +161,21 @@ pub fn run(
 
     disable_raw_mode()?;
     execute!(term.backend_mut(), LeaveAlternateScreen)?;
-    Ok(())
+    Ok(action)
 }
 
 // ─── Root render ─────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn render(
-    f:       &mut Frame<CrosstermBackend<io::Stdout>>,
-    state:   &SharedState,
-    log_buf: &LogBuf,
-    tab:     usize,
-    log_off: usize,
+    f:           &mut Frame<CrosstermBackend<io::Stdout>>,
+    state:       &SharedState,
+    log_buf:     &LogBuf,
+    tab:         usize,
+    log_off:     usize,
+    cfg_entries: &[ConfigEntry],
+    cfg_sel:     usize,
+    picker:      &ConfigPicker,
 ) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -110,6 +191,7 @@ fn render(
     match tab {
         0 => render_status(f, rows[1], state),
         1 => render_log(f,    rows[1], log_buf, log_off),
+        2 => render_configs(f, rows[1], cfg_entries, cfg_sel, picker),
         _ => {}
     }
 
@@ -132,7 +214,12 @@ fn render_tab_bar(
         Spans::from(vec![
             Span::raw("  "),
             Span::styled("2", Style::default().fg(YELLOW)),
-            Span::raw(" Log     "),
+            Span::raw(" Log  "),
+        ]),
+        Spans::from(vec![
+            Span::raw("  "),
+            Span::styled("3", Style::default().fg(YELLOW)),
+            Span::raw(" Configs  "),
         ]),
     ];
 
@@ -192,12 +279,24 @@ fn render_status(
     let ks_color = if info.ks_active { GREEN } else { GRAY };
 
     let proto_color = if info.protocol == "WireGuard" { AQUA } else { BLUE };
+
+    // City, Country — matches the log format; placeholder until the
+    // background geo lookup finishes
+    let location = if info.server_city.is_empty() && info.server_country.is_empty() {
+        "resolving...".to_string()
+    } else {
+        format!("{}, {}", info.server_city, info.server_country)
+    };
+    let public_ip = info.public_ip.as_deref().unwrap_or(
+        if vpn_state == VpnState::Connected { "resolving..." } else { "—" }
+    );
+
     let rows = vec![
         kv("State",      icon, sc),
         kv("Protocol",   if info.protocol.is_empty() { "—" } else { &info.protocol }, proto_color),
         kv("Server",     &info.server_host, FG),
-        kv("Location",   &format!("{}, {}", info.server_country, info.server_city), BLUE),
-        kv("Public IP",  info.public_ip.as_deref().unwrap_or("—"), AQUA),
+        kv("Location",   &location, BLUE),
+        kv("Public IP",  public_ip, AQUA),
         kv("Interface",  info.vpn_iface.as_deref().unwrap_or("—"), FG),
         kv("Uptime",     &uptime, YELLOW),
         blank(),
@@ -284,6 +383,71 @@ fn render_log(
     f.render_widget(list, area);
 }
 
+// ─── Configs tab ─────────────────────────────────────────────────────────────
+
+fn render_configs(
+    f:       &mut Frame<CrosstermBackend<io::Stdout>>,
+    area:    Rect,
+    entries: &[ConfigEntry],
+    sel:     usize,
+    picker:  &ConfigPicker,
+) {
+    let title = match &picker.dir {
+        Some(d) => format!(" Configs ({}) ", d.display()),
+        None    => " Configs ".to_string(),
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(title, Style::default().fg(BLUE)))
+        .border_style(Style::default().fg(GRAY));
+
+    if entries.is_empty() {
+        let msg = match &picker.dir {
+            Some(d) => format!("no .ovpn / WireGuard .conf files found in {}", d.display()),
+            None    => "connected via --host — no config directory to scan".to_string(),
+        };
+        let p = Paragraph::new(msg)
+            .style(Style::default().fg(GRAY))
+            .block(block)
+            .wrap(Wrap { trim: true });
+        f.render_widget(p, area);
+        return;
+    }
+
+    // Keep the selection visible in the window
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let start = if inner_h == 0 || sel < inner_h { 0 } else { sel + 1 - inner_h };
+
+    let items: Vec<ListItem> = entries
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(inner_h.max(1))
+        .map(|(i, e)| {
+            let is_cur = picker.is_current(&e.path);
+            let marker = if is_cur { "● " } else { "  " };
+            let kind_color = if e.kind == "WireGuard" { AQUA } else { BLUE };
+
+            let mut name_style = Style::default().fg(if is_cur { GREEN } else { FG });
+            let mut row_prefix = Style::default().fg(GREEN);
+            if i == sel {
+                name_style = name_style.add_modifier(Modifier::REVERSED);
+                row_prefix = row_prefix.add_modifier(Modifier::REVERSED);
+            }
+
+            ListItem::new(Spans::from(vec![
+                Span::styled(marker.to_string(), row_prefix),
+                Span::styled(format!("{:<36}", e.name), name_style),
+                Span::styled(format!(" {:<10}", e.kind), Style::default().fg(kind_color)),
+                Span::styled(format!(" {}", e.server), Style::default().fg(GRAY)),
+            ]))
+        })
+        .collect();
+
+    let list = List::new(items).block(block);
+    f.render_widget(list, area);
+}
+
 // ─── Help bar ─────────────────────────────────────────────────────────────────
 
 fn render_help(
@@ -292,18 +456,25 @@ fn render_help(
     tab:  usize,
 ) {
     let mut spans = vec![
-        Span::styled("[Tab/1/2]", Style::default().fg(YELLOW)),
+        Span::styled("[Tab/1/2/3]", Style::default().fg(YELLOW)),
         Span::raw(" switch   "),
         Span::styled("[q / Esc]", Style::default().fg(RED)),
         Span::raw(" disconnect & quit   "),
     ];
-    if tab == 1 {
-        spans.extend([
+    match tab {
+        1 => spans.extend([
             Span::styled("[↑↓ PgUp PgDn]", Style::default().fg(YELLOW)),
             Span::raw(" scroll   "),
             Span::styled("[End]", Style::default().fg(YELLOW)),
             Span::raw(" jump to bottom"),
-        ]);
+        ]),
+        2 => spans.extend([
+            Span::styled("[↑↓]", Style::default().fg(YELLOW)),
+            Span::raw(" select   "),
+            Span::styled("[Enter]", Style::default().fg(GREEN)),
+            Span::raw(" reconnect with selected config"),
+        ]),
+        _ => {}
     }
     let p = Paragraph::new(Spans::from(spans))
         .alignment(Alignment::Left)
