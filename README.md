@@ -66,6 +66,10 @@ sudo install -m755 target/release/vpn-manager /usr/local/bin/
 ## Usage
 
 ```bash
+# List all VPN configs (.ovpn / WireGuard .conf) in a folder
+vpn-manager list ~/vpn-configs
+# (passing a directory to --config also lists what's inside)
+
 # Connect using a .ovpn profile
 sudo vpn-manager connect --config ~/myvpn.ovpn
 
@@ -77,7 +81,7 @@ sudo vpn-manager connect --config ~/myvpn.ovpn \
     --dns 1.1.1.1 1.0.0.1 \
     --auth-file ~/creds.txt
 
-# Headless (no TUI)
+# Headless (no TUI) — stays connected until Ctrl-C or `vpn-manager disconnect`
 sudo vpn-manager connect --config ~/myvpn.ovpn --no-tui
 
 # Graceful disconnect
@@ -95,27 +99,42 @@ vpn-manager status
 ## TUI
 
 ```
-╭─ vpn-manager ──────────────────────────────╮
-│  1 Status    2 Log                          │
-╰─────────────────────────────────────────────╯
-
- Status tab                  Traffic tab
- ──────────────────────       ─────────────────
- State         ● CONNECTED   ↑ Sent      42 MB
- Server        vpn.example   ↑ Rate      1.2 MB/s
- Location      Berlin, DE    ↓ Received  180 MB
- Public IP     203.0.113.7   ↓ Rate      8.4 MB/s
- Interface     tun0
+╭─ vpn-manager ───────────────────────────────────────────────╮
+│  1 Dashboard    2 Log    3 Configs                           │
+╰──────────────────────────────────────────────────────────────╯
+╭──────────────────────────────────────────────────────────────╮
+│ ● CONNECTED  ·  WireGuard  ·  203.0.113.7  ·  Berlin, DE  ·  up 00:12:47
+╰──────────────────────────────────────────────────────────────╯
+ Connection                    Traffic
+ ─────────────────────────      ────────────────────
+ State         ● CONNECTED     ↑ Sent      42 MB
+ Server        vpn.example     ↑ Rate      1.2 MB/s
+ Location      Berlin, DE      ↓ Received  180 MB
+ Public IP     203.0.113.7     ↓ Rate      8.4 MB/s
+ Interface     wgvpnm
  Uptime        00:12:47
  Kill Switch   ● ACTIVE
- DNS           1.1.1.1  8.8.8.8
+ DNS           10.2.0.1
+╭ ↑ 1.2 MB/s  peak 3 MB/s ─╮  ╭ ↓ 8.4 MB/s  peak 12 MB/s ╮
+│      ▂▄▆█▅▃▁▂▄           │  │  ▁▃▅▇█▆▄▂▁▂▃▅            │
+╰──────────────────────────╯  ╰──────────────────────────╯
 ```
+
+The **Dashboard** is colour-coded by connection state (green connected,
+yellow connecting, red error — banner, borders, and tab frame all follow it)
+and shows live upload/download sparklines built from 1-second rate samples
+(last ~5 minutes).
 
 **Log tab** shows live verbose output from openvpn and the manager itself,
 colour-coded by severity.  Scroll with `↑ ↓ PgUp PgDn`, jump to the bottom
 with `End`.
 
-**Keys:** `Tab` / `1` / `2` switch tabs.  `q` or `Esc` disconnects and quits.
+**Configs tab** lists every .ovpn / WireGuard .conf sitting next to the
+config you connected with (● marks the active one).  Select with `↑ ↓` and
+press `Enter` to disconnect and reconnect using the selected config — the
+kill switch is re-armed with the new server's endpoints.
+
+**Keys:** `Tab` / `1` / `2` / `3` switch tabs.  `q` or `Esc` disconnects and quits.
 
 ---
 
