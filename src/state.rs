@@ -113,10 +113,20 @@ impl SessionFile {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+/// Local-time HH:MM:SS for log entries (not UTC).
+pub fn local_hms() -> String {
+    unsafe {
+        let t = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&t, &mut tm);
+        format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+    }
+}
+
 pub fn log_push(buf: &LogBuf, msg: impl Into<String>) {
     let mut b = buf.lock().unwrap();
     if b.len() >= 4096 { b.pop_front(); }
-    b.push_back(msg.into());
+    b.push_back(format!("[{}] {}", local_hms(), msg.into()));
 }
 
 pub fn human_bytes(n: u64) -> String {

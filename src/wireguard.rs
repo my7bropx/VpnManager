@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::state::LogBuf;
+use crate::state::{log_push, LogBuf};
 
 pub const TMP_CONF: &str = "/tmp/wgvpnm.conf";
 const WG_IFACE: &str = "wgvpnm";
@@ -23,6 +23,13 @@ impl WireGuardSession {
         // Copy to a fixed short name so the derived interface name stays ≤15 chars
         std::fs::copy(config, TMP_CONF)
             .context("copy WireGuard config to /tmp/wgvpnm.conf")?;
+
+        // 600 — the config holds the private key, and wg-quick warns
+        // "world accessible" otherwise
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(TMP_CONF, std::fs::Permissions::from_mode(0o600));
+        }
 
         if verbose {
             println!("[vpn-manager] wg-quick up {TMP_CONF}");
@@ -41,7 +48,7 @@ impl WireGuardSession {
 
         for line in stdout.lines().chain(stderr.lines()) {
             let entry = format!("wg-quick  {line}");
-            push_log(log, &entry);
+            log_push(log, &entry);
             if verbose { println!("{entry}"); }
         }
 
@@ -129,15 +136,4 @@ pub fn parse_endpoints(path: &Path) -> Vec<(String, u16, String)> {
         }
     }
     out
-}
-
-// ─── Internal ─────────────────────────────────────────────────────────────────
-
-fn push_log(log: &LogBuf, msg: &str) {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let s = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    let ts = format!("{:02}:{:02}:{:02}", (s % 86400) / 3600, (s % 3600) / 60, s % 60);
-    let mut b = log.lock().unwrap();
-    if b.len() >= 4096 { b.pop_front(); }
-    b.push_back(format!("[{ts}] {msg}"));
 }

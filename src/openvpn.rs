@@ -22,7 +22,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::{network, state::LogBuf};
+use crate::network;
+use crate::state::{log_push, LogBuf};
 
 // ─── OpenVpnProcess ───────────────────────────────────────────────────────────
 
@@ -214,15 +215,25 @@ impl OpenVpnProcess {
 
         let mut cmd = Command::new(&bin);
         cmd.args([
-            "--config",               config.to_str().unwrap(),
-            "--verb",                 verb,
-            "--log",                  log_path_str,  // our output channel
+            "--config",            config.to_str().unwrap(),
+            "--verb",              verb,
+            "--log",               log_path_str,  // our output channel
             "--auth-nocache",
-            "--connect-retry",        "5",
-            "--connect-retry-max",    "3",
-            "--explicit-exit-notify", "2",
+            "--connect-retry",     "5",
+            "--connect-retry-max", "3",
+            // Providers often pin small socket buffers in their configs which
+            // caps throughput; 0 lets the kernel autotune. These come after
+            // --config so they override whatever the profile sets.
+            "--sndbuf",            "0",
+            "--rcvbuf",            "0",
             // NO --persist-tun
         ]);
+
+        // --explicit-exit-notify is UDP-only; openvpn refuses to start when it
+        // is combined with a proto tcp profile.
+        if !config_uses_tcp(config) {
+            cmd.args(["--explicit-exit-notify", "2"]);
+        }
 
         if let Some(auth) = auth_file {
             cmd.args(["--auth-user-pass", auth.to_str().unwrap()]);
@@ -300,7 +311,7 @@ fn tail_log(
         if Instant::now() >= deadline {
             let msg = "ERROR: openvpn log file empty after 5 s — binary may not exist or crashed \
                  immediately. Check: which openvpn  or  ls /usr/sbin/openvpn".to_string();
-            push_log(&ring, &msg);
+            log_push(&ring, &msg);
             if verbose { eprintln!("{msg}"); }
             *fail_reason.lock().unwrap() = Some("openvpn did not start".into());
             return;
@@ -316,7 +327,7 @@ fn tail_log(
     let file = match std::fs::File::open(&log_path) {
         Ok(f) => f,
         Err(e) => {
-            push_log(&ring, &format!("ERROR: open openvpn log: {e}"));
+            log_push(&ring, format!("ERROR: open openvpn log: {e}"));
             return;
         }
     };
@@ -338,7 +349,7 @@ fn tail_log(
         if line.is_empty() { continue; }
 
         let entry = format!("openvpn  {line}");
-        push_log(&ring, &entry);
+        log_push(&ring, &entry);
         if verbose { println!("{entry}"); }
 
         if let Some(ref mut f) = user_sink {
@@ -397,18 +408,30 @@ fn resolve_openvpn_bin() -> String {
     "openvpn".to_string()
 }
 
+/// True if the profile connects over TCP (top-level `proto` or a per-`remote` proto).
+fn config_uses_tcp(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else { return false };
+    text.lines().map(str::trim).any(|t| {
+        (t.starts_with("proto ") && t.contains("tcp"))
+            || (t.starts_with("remote ")
+                && t.split_whitespace().nth(3).is_some_and(|p| p.contains("tcp")))
+    })
+}
+
 /// Write a minimal in-house .ovpn config for --host mode (no `daemon`, no `persist-tun`).
 fn write_minimal_config(host: &str, port: u16, proto: &str, dns: &[String]) -> Result<PathBuf> {
     use std::io::Write;
     let p1 = dns.first().map(|s| s.as_str()).unwrap_or("1.1.1.1");
     let p2 = dns.get(1).map(|s| s.as_str()).unwrap_or(p1);
+    // fast-io is UDP-only; sndbuf/rcvbuf 0 = kernel-autotuned buffers
+    let fast_io = if proto.contains("udp") { "fast-io\n" } else { "" };
     let content = format!(
         "client\ndev tun\nproto {proto}\nremote {host} {port}\n\
          resolv-retry infinite\nnobind\npersist-key\n\
          remote-cert-tls server\ncipher AES-256-GCM\nauth SHA256\n\
          verb 3\nmute 20\nauth-user-pass\nredirect-gateway def1\n\
          block-outside-dns\ndhcp-option DNS {p1}\ndhcp-option DNS {p2}\n\
-         sndbuf 393216\nrcvbuf 393216\nfast-io\nkeepalive 10 30\n"
+         sndbuf 0\nrcvbuf 0\n{fast_io}keepalive 10 30\n"
     );
     let path = std::env::temp_dir().join(format!("vpnmgr-gen-{}.ovpn", std::process::id()));
     let mut f = std::fs::File::create(&path).context("create generated config")?;
@@ -416,11 +439,3 @@ fn write_minimal_config(host: &str, port: u16, proto: &str, dns: &[String]) -> R
     Ok(path)
 }
 
-fn push_log(log: &LogBuf, msg: &str) {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let s = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    let ts = format!("{:02}:{:02}:{:02}", (s % 86400) / 3600, (s % 3600) / 60, s % 60);
-    let mut b = log.lock().unwrap();
-    if b.len() >= 4096 { b.pop_front(); }
-    b.push_back(format!("[{ts}] {msg}"));
-}
