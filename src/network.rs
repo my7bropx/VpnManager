@@ -74,11 +74,28 @@ pub fn active_vpn_interface() -> Option<String> {
 
 /// True if all traffic is being routed through `iface`.
 ///
-/// Two valid patterns:
+/// Primary check: `ip route get <external ip>` — asks the kernel where a real
+/// packet would actually go. This honours policy routing, which wg-quick uses
+/// (fwmark rules + table 51820); the main table never shows a default route
+/// through a wg interface, so inspecting `ip route show` alone gives false
+/// "not through VPN" warnings for WireGuard.
+///
+/// Fallback: main-table inspection for the two OpenVPN patterns:
 ///   1. Literal default route:  "default via X dev tun0"
-///   2. Split-route (OpenVPN):  0.0.0.0/1 + 128.0.0.0/1 both via `iface`
-///      (together these cover all of IPv4, equivalent to a default route)
+///   2. Split-route:            0.0.0.0/1 + 128.0.0.0/1 both via `iface`
 pub fn default_route_is_vpn(iface: &str) -> bool {
+    if let Ok(out) = Command::new("ip").args(["-4", "route", "get", "1.1.1.1"]).output() {
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if let Some(dev) = text.split_whitespace()
+                .skip_while(|w| *w != "dev")
+                .nth(1)
+            {
+                return dev == iface;
+            }
+        }
+    }
+
     let out = match Command::new("ip").args(["-4", "route", "show"]).output() {
         Ok(o) => o,
         Err(_) => return false,
