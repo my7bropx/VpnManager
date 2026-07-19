@@ -1,7 +1,10 @@
 # vpn-manager
 
-A clean Rust rewrite of the Python VPN manager — OpenVPN wrapper with an
-iptables kill switch, automatic interface teardown, and a live two-tab TUI.
+A clean Rust rewrite of the Python VPN manager — OpenVPN / WireGuard wrapper
+with an iptables kill switch, automatic interface teardown, and a live
+three-tab TUI (Dashboard · Log · Configs).
+
+![vpn-manager dashboard — live WireGuard connection with kill switch active and traffic sparklines](Vpn-ManagerScreenShot.png)
 
 ---
 
@@ -94,6 +97,10 @@ sudo vpn-manager recover
 vpn-manager status
 ```
 
+`connect` validates the config up front — before the root check — so a
+broken profile (masked `*****` placeholder key, missing `remote`) fails
+fast with a clear message instead of tearing anything down.
+
 ---
 
 ## TUI
@@ -133,6 +140,21 @@ with `End`.
 config you connected with (● marks the active one).  Select with `↑ ↓` and
 press `Enter` to disconnect and reconnect using the selected config — the
 kill switch is re-armed with the new server's endpoints.
+
+Switching is safe against broken configs:
+
+- The selected config is **validated before the current tunnel is touched**
+  (WireGuard needs a real base64 `PrivateKey` and an `Endpoint`; OpenVPN
+  needs a `remote` directive).  A config with a masked `*****` placeholder
+  key — the kind some providers export from their web page — is rejected
+  with a message telling you to re-download it, and the current tunnel
+  stays up.  Failures are logged and the TUI jumps to the Log tab.
+- If a config passes validation but the switch still fails to connect
+  (bad auth, unreachable endpoint), vpn-manager **reconnects to the
+  previously working config** instead of exiting disconnected.
+- WireGuard configs are normalised on copy (BOM/CRLF stripped), so a `\r`
+  glued to the key no longer causes wg-quick's
+  "Key is not the correct length" error.
 
 **Keys:** `Tab` / `1` / `2` / `3` switch tabs.  `q` or `Esc` disconnects and quits.
 
