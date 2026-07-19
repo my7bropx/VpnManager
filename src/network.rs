@@ -1,9 +1,9 @@
 #![allow(dead_code)]
-/// network.rs – system-level networking operations
-///
-/// All functions here operate directly on kernel networking state via `ip`,
-/// iptables helpers, and /proc. Kept as pure functions (no global state) so
-/// they can be called from any context, including emergency paths.
+//! network.rs – system-level networking operations
+//!
+//! All functions here operate directly on kernel networking state via `ip`,
+//! iptables helpers, and /proc. Kept as pure functions (no global state) so
+//! they can be called from any context, including emergency paths.
 
 use anyhow::{Context, Result};
 use std::process::Command;
@@ -30,7 +30,7 @@ pub fn teardown_vpn_interfaces() -> Result<()> {
         })
         .filter_map(|l| {
             // "3: tun0: <..." → "tun0"
-            l.splitn(3, ':').nth(1).map(|s| s.trim().split('@').next().unwrap_or("").trim().to_string())
+            l.split(':').nth(1).map(|s| s.trim().split('@').next().unwrap_or("").trim().to_string())
         })
         .filter(|s| !s.is_empty())
         .collect();
@@ -67,18 +67,50 @@ pub fn active_vpn_interface() -> Option<String> {
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .find(|l| l.contains(": tun") || l.contains(": wg"))
-        .and_then(|l| l.splitn(3, ':').nth(1))
+        .and_then(|l| l.split(':').nth(1))
         .map(|s| s.trim().split('@').next().unwrap_or("").trim().to_string())
         .filter(|s| !s.is_empty())
 }
 
-/// True if the kernel default route exits through `iface`.
+/// True if all traffic is being routed through `iface`.
+///
+/// Primary check: `ip route get <external ip>` — asks the kernel where a real
+/// packet would actually go. This honours policy routing, which wg-quick uses
+/// (fwmark rules + table 51820); the main table never shows a default route
+/// through a wg interface, so inspecting `ip route show` alone gives false
+/// "not through VPN" warnings for WireGuard.
+///
+/// Fallback: main-table inspection for the two OpenVPN patterns:
+///   1. Literal default route:  "default via X dev tun0"
+///   2. Split-route:            0.0.0.0/1 + 128.0.0.0/1 both via `iface`
 pub fn default_route_is_vpn(iface: &str) -> bool {
-    Command::new("ip")
-        .args(["-4", "route", "show", "default"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains(iface))
-        .unwrap_or(false)
+    if let Ok(out) = Command::new("ip").args(["-4", "route", "get", "1.1.1.1"]).output() {
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if let Some(dev) = text.split_whitespace()
+                .skip_while(|w| *w != "dev")
+                .nth(1)
+            {
+                return dev == iface;
+            }
+        }
+    }
+
+    let out = match Command::new("ip").args(["-4", "route", "show"]).output() {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+
+    // Pattern 1: literal default
+    if text.lines().any(|l| l.starts_with("default") && l.contains(iface) ) {
+        return true;
+    }
+
+    // Pattern 2: split-route (0.0.0.0/1 AND 128.0.0.0/1 through iface)
+    let has_lower = text.lines().any(|l| l.contains("0.0.0.0/1") && l.contains(iface));
+    let has_upper = text.lines().any(|l| l.contains("128.0.0.0/1") && l.contains(iface));
+    has_lower && has_upper
 }
 
 /// Detect local (LAN) network CIDRs for kill-switch LAN bypass.
@@ -104,7 +136,7 @@ pub fn iface_bytes(iface: &str) -> Option<(u64, u64)> {
     for line in content.lines() {
         let trimmed = line.trim_start();
         if trimmed.starts_with(iface) && trimmed.as_bytes().get(iface.len()) == Some(&b':') {
-            let parts: Vec<&str> = trimmed.splitn(2, ':').nth(1)?.split_whitespace().collect();
+            let parts: Vec<&str> = trimmed.split_once(':')?.1.split_whitespace().collect();
             let rx = parts.first()?.parse::<u64>().ok()?;
             let tx = parts.get(8)?.parse::<u64>().ok()?;
             return Some((rx, tx));

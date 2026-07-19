@@ -1,10 +1,16 @@
-/// openvpn.rs – OpenVPN process wrapper
-///
-/// Key fixes over the Python version:
-///  - No `persist-tun` in generated configs
-///  - disconnect(): SIGTERM → 10 s wait → SIGKILL, then teardown_vpn_interfaces()
-///  - force_disconnect(): SIGKILL immediately, then teardown_vpn_interfaces()
-///  - Drop impl guarantees force_disconnect() is called even on panic
+#![allow(dead_code)]
+//! openvpn.rs – OpenVPN process wrapper
+//!
+//! Robustness decisions:
+//!  - Preprocesses the .ovpn config to strip `daemon`, `log`, `log-append`,
+//!    `persist-tun` — directives that silently break our process management
+//!  - Uses `--log <tmpfile>` (not stderr pipe) as the output channel — immune
+//!    to per-distro openvpn stderr buffering and config-level log overrides
+//!  - Resolves the openvpn binary through common sbin paths because sudo
+//!    typically strips /usr/sbin from PATH
+//!  - disconnect(): SIGTERM → 10 s grace → SIGKILL, then teardown_vpn_interfaces()
+//!  - force_disconnect(): SIGKILL immediately + teardown
+//!  - Drop guarantees force_disconnect() even on panic
 
 use anyhow::{Context, Result};
 use nix::sys::signal::{kill, Signal};
@@ -16,77 +22,76 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::{network, state::LogBuf};
+use crate::network;
+use crate::state::{log_push, LogBuf};
 
 // ─── OpenVpnProcess ───────────────────────────────────────────────────────────
 
 pub struct OpenVpnProcess {
     child:        Option<Child>,
+    /// Temp file for the sanitised config we generate
     tmp_config:   Option<PathBuf>,
+    /// Temp file openvpn writes its log into (kept alive for session duration)
+    tmp_log:      Option<PathBuf>,
     pub connected:    Arc<Mutex<bool>>,
     pub fail_reason:  Arc<Mutex<Option<String>>>,
     log:          LogBuf,
-    /// If set, every log line is also written here (appended, created if absent)
-    pub log_file: Option<std::path::PathBuf>,
-    /// If true, every openvpn line is also printed to stdout while connecting
+    /// User-supplied extra log file (appended, always created)
+    pub log_file: Option<PathBuf>,
+    /// Stream openvpn lines to stdout in real time
     pub verbose:  bool,
+    /// Path of the active openvpn log (useful for post-mortem)
+    pub ovpn_log_path: Option<PathBuf>,
 }
 
 impl OpenVpnProcess {
     pub fn new(log: LogBuf) -> Self {
         Self {
-            child:       None,
-            tmp_config:  None,
-            connected:   Arc::new(Mutex::new(false)),
-            fail_reason: Arc::new(Mutex::new(None)),
+            child:         None,
+            tmp_config:    None,
+            tmp_log:       None,
+            connected:     Arc::new(Mutex::new(false)),
+            fail_reason:   Arc::new(Mutex::new(None)),
             log,
-            log_file:    None,
-            verbose:     false,
+            log_file:      None,
+            verbose:       false,
+            ovpn_log_path: None,
         }
     }
 
-    // ── Start with a provided .ovpn file ─────────────────────────────────────
+    // ── Public API ────────────────────────────────────────────────────────────
 
-    pub fn start_with_config(
-        &mut self,
-        config: &Path,
-        auth_file: Option<&Path>,
-    ) -> Result<()> {
-        self.spawn_process(config, auth_file)
+    pub fn start_with_config(&mut self, config: &Path, auth_file: Option<&Path>) -> Result<()> {
+        let clean = self.sanitise_config(config)?;
+        self.spawn_process(&clean, auth_file)
     }
-
-    // ── Generate a minimal config and start ──────────────────────────────────
 
     pub fn start_generic(
         &mut self,
-        host:       &str,
-        port:       u16,
-        proto:      &str,
-        dns:        &[String],
-        auth_file:  Option<&Path>,
+        host:      &str,
+        port:      u16,
+        proto:     &str,
+        dns:       &[String],
+        auth_file: Option<&Path>,
     ) -> Result<()> {
-        let cfg = write_temp_config(host, port, proto, dns)
+        let cfg = write_minimal_config(host, port, proto, dns)
             .context("generate openvpn config")?;
         self.tmp_config = Some(cfg.clone());
         self.spawn_process(&cfg, auth_file)
     }
 
-    // ── Wait until "Initialization Sequence Completed" or failure ────────────
-
+    /// Block until "Initialization Sequence Completed" or a known failure, with timeout.
     pub fn wait_connected(&self, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
         loop {
             if *self.connected.lock().unwrap() { return Ok(()); }
-
-            if let Some(reason) = self.fail_reason.lock().unwrap().clone() {
-                anyhow::bail!("{}", reason);
+            if let Some(r) = self.fail_reason.lock().unwrap().clone() {
+                anyhow::bail!("{}", r);
             }
-
             if Instant::now() >= deadline {
-                anyhow::bail!("connection timed out after {}s", timeout.as_secs());
+                anyhow::bail!("timed out after {}s", timeout.as_secs());
             }
-
-            thread::sleep(Duration::from_millis(400));
+            thread::sleep(Duration::from_millis(200));
         }
     }
 
@@ -97,215 +102,340 @@ impl OpenVpnProcess {
         }
     }
 
-    // ── Graceful disconnect ───────────────────────────────────────────────────
-
     pub fn disconnect(&mut self) {
         if let Some(child) = &self.child {
-            // SIGTERM → graceful OpenVPN shutdown (runs down scripts)
             let pid = Pid::from_raw(child.id() as i32);
             let _ = kill(pid, Signal::SIGTERM);
-
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while Instant::now() < deadline {
+            let dl = Instant::now() + Duration::from_secs(10);
+            loop {
                 if let Some(c) = &mut self.child {
                     if c.try_wait().ok().flatten().is_some() { break; }
                 }
+                if Instant::now() >= dl { break; }
                 thread::sleep(Duration::from_millis(200));
             }
-
-            // Force-kill if still running
-            if let Some(c) = &mut self.child {
-                if c.try_wait().ok().flatten().is_none() {
-                    let _ = c.kill();
-                    let _ = c.wait();
-                }
-            }
         }
-
+        if let Some(c) = &mut self.child { let _ = c.kill(); let _ = c.wait(); }
         self.child = None;
         *self.connected.lock().unwrap() = false;
-
-        // CRITICAL FIX: explicitly tear down the interface.
-        // OpenVPN's graceful shutdown removes routes via its down script, but
-        // SIGKILL bypasses that, and even SIGTERM can race. We always do it
-        // ourselves so the routing table is clean regardless.
         let _ = network::teardown_vpn_interfaces();
-
-        self.remove_tmp_config();
+        self.cleanup();
     }
-
-    // ── Force kill (emergency) ────────────────────────────────────────────────
 
     pub fn force_disconnect(&mut self) {
-        if let Some(c) = &mut self.child {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
+        if let Some(c) = &mut self.child { let _ = c.kill(); let _ = c.wait(); }
         self.child = None;
         *self.connected.lock().unwrap() = false;
-
-        // Same fix as above – explicit interface teardown
         let _ = network::teardown_vpn_interfaces();
-
-        self.remove_tmp_config();
+        self.cleanup();
     }
 
-    // ── Internal ─────────────────────────────────────────────────────────────
+    // ── Config sanitiser ─────────────────────────────────────────────────────
+    //
+    // Many provider configs include directives that silently break our process
+    // management. We strip them from a temp copy before passing to openvpn.
+
+    fn sanitise_config(&mut self, original: &Path) -> Result<PathBuf> {
+        let raw = std::fs::read_to_string(original)
+            .with_context(|| format!("read config {}", original.display()))?;
+
+        // Reject WireGuard configs early with a useful message
+        let is_wireguard = raw.lines().any(|l| {
+            matches!(l.trim(), "[Interface]" | "[Peer]")
+        });
+        if is_wireguard {
+            anyhow::bail!(
+                "{} is a WireGuard config, not an OpenVPN config.\n\
+                 Use `wg-quick up {}` or a WireGuard client instead.",
+                original.display(),
+                original.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("wg0")
+            );
+        }
+
+        // Directives to strip (matched as line prefix, case-insensitive)
+        const STRIP: &[&str] = &[
+            "daemon",        // forks openvpn — we lose process control entirely
+            "log ",          // redirects output away from our log file
+            "log-append ",   // same
+            "persist-tun",   // keeps tun alive after process death → orphaned routes
+            "writepid",      // we track the pid ourselves
+        ];
+
+        let cleaned: String = raw
+            .lines()
+            .filter(|line| {
+                let t = line.trim().to_lowercase();
+                // Keep the line unless it starts with one of our strip prefixes
+                // or equals a bare keyword (e.g. bare "daemon" with no arg)
+                !STRIP.iter().any(|s| {
+                    let s = s.trim();
+                    t == s || t.starts_with(&format!("{s} ")) || t.starts_with(&format!("{s}\t"))
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Write to temp file
+        let tmp = std::env::temp_dir().join(format!(
+            "vpnmgr-config-{}.ovpn",
+            std::process::id()
+        ));
+        std::fs::write(&tmp, cleaned).context("write sanitised config")?;
+        self.tmp_config = Some(tmp.clone());
+
+        if self.verbose {
+            println!("[vpn-manager] config (sanitised) : {}", tmp.display());
+        }
+
+        Ok(tmp)
+    }
+
+    // ── Process spawning ──────────────────────────────────────────────────────
 
     fn spawn_process(&mut self, config: &Path, auth_file: Option<&Path>) -> Result<()> {
-        let mut cmd = Command::new("openvpn");
+        // ── Resolve binary ────────────────────────────────────────────────────
+        // sudo commonly strips /usr/sbin from PATH; try explicit locations first.
+        let bin = resolve_openvpn_bin();
+
+        // ── Dedicated log file ────────────────────────────────────────────────
+        // We tell openvpn to write to a temp file via --log so we own the output
+        // channel regardless of what the .ovpn config says.
+        let log_path = std::env::temp_dir()
+            .join(format!("vpnmgr-ovpn-{}.log", std::process::id()));
+        // Pre-create the file so openvpn doesn't complain about permissions
+        std::fs::write(&log_path, "").context("create openvpn log file")?;
+        self.tmp_log       = Some(log_path.clone());
+        self.ovpn_log_path = Some(log_path.clone());
+
+        // ── Build argv ────────────────────────────────────────────────────────
+        let verb = if self.verbose { "5" } else { "3" };
+        let log_path_str = log_path.to_str().unwrap();
+
+        let mut cmd = Command::new(&bin);
         cmd.args([
-            "--config",              config.to_str().unwrap(),
+            "--config",            config.to_str().unwrap(),
+            "--verb",              verb,
+            "--log",               log_path_str,  // our output channel
             "--auth-nocache",
-            "--connect-retry",       "5",
-            "--connect-retry-max",   "3",
-            "--explicit-exit-notify","2",
-            // NO --persist-tun (root cause of the original network-lock bug)
+            "--connect-retry",     "5",
+            "--connect-retry-max", "3",
+            // Providers often pin small socket buffers in their configs which
+            // caps throughput; 0 lets the kernel autotune. These come after
+            // --config so they override whatever the profile sets.
+            "--sndbuf",            "0",
+            "--rcvbuf",            "0",
+            // NO --persist-tun
         ]);
-        if self.verbose {
-            cmd.args(["--verb", "5"]);
+
+        // --explicit-exit-notify is UDP-only; openvpn refuses to start when it
+        // is combined with a proto tcp profile.
+        if !config_uses_tcp(config) {
+            cmd.args(["--explicit-exit-notify", "2"]);
         }
 
         if let Some(auth) = auth_file {
             cmd.args(["--auth-user-pass", auth.to_str().unwrap()]);
         }
-        // If no auth_file: openvpn reads credentials from its own stdin prompt
-        // (inherited below). Do NOT add a bare --auth-user-pass here; the .ovpn
-        // config already contains it and adding it twice causes a double-prompt.
 
-        // KEY FIX: OpenVPN writes ALL log output to stderr, not stdout.
-        // The original code piped stdout and nulled stderr, so the reader thread
-        // saw nothing and the 45 s connect timeout always fired.
-        //
-        // stdin  -> inherited  (lets openvpn prompt for credentials interactively)
-        // stdout -> null       (openvpn doesn't use stdout meaningfully)
-        // stderr -> piped      (all log lines incl. "Initialization Sequence Completed")
+        // stdin inherited → credential prompts reach the terminal
+        // stdout → null (everything goes to --log file)
+        // stderr → appended to log file so early crash messages are captured
+        let stderr_sink = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+            .context("open log file for stderr")?;
         cmd.stdin(Stdio::inherit())
            .stdout(Stdio::null())
-           .stderr(Stdio::piped());
+           .stderr(stderr_sink);
 
-        let mut child = cmd.spawn().context("spawn openvpn")?;
-        let stderr = child.stderr.take().expect("stderr pipe");
+        if self.verbose {
+            println!("[vpn-manager] openvpn binary : {bin}");
+            println!("[vpn-manager] openvpn log   : {log_path_str}");
+        }
+
+        let child = cmd.spawn()
+            .with_context(|| format!(
+                "failed to exec openvpn ({bin}) — is it installed?\n\
+                 Try: apt install openvpn  or  which openvpn"
+            ))?;
 
         self.child = Some(child);
 
-        // Spawn a monitor thread that reads openvpn stderr
+        // ── Log-tail thread ───────────────────────────────────────────────────
         let connected   = Arc::clone(&self.connected);
         let fail_reason = Arc::clone(&self.fail_reason);
-        let log         = Arc::clone(&self.log);
+        let ring        = Arc::clone(&self.log);
+        let user_log    = self.log_file.clone();
+        let verbose     = self.verbose;
+        let lp          = log_path.clone();
 
         thread::Builder::new()
-            .name("openvpn-reader".into())
-            .spawn(move || {
-                let reader = BufReader::new(stderr);
-                for raw in reader.lines() {
-                    let Ok(line) = raw else { break };
-                    let line = line.trim().to_string();
-                    if line.is_empty() { continue; }
-
-                    push_log(&log, &format!("openvpn  {line}"));
-
-                    if line.contains("Initialization Sequence Completed") {
-                        *connected.lock().unwrap() = true;
-
-                    } else if line.contains("AUTH_FAILED") || line.contains("auth-failure") {
-                        *fail_reason.lock().unwrap() =
-                            Some(format!("authentication failed: {line}"));
-
-                    } else if line.contains("TLS Error") || line.contains("TLS_ERROR") {
-                        *fail_reason.lock().unwrap() =
-                            Some(format!("TLS error: {line}"));
-
-                    } else if line.contains("process exiting") || line.contains("SIGTERM") {
-                        *connected.lock().unwrap() = false;
-                    }
-                }
-                // EOF → process died
-                *connected.lock().unwrap() = false;
-            })
-            .context("spawn reader thread")?;
+            .name("ovpn-tailer".into())
+            .spawn(move || tail_log(lp, connected, fail_reason, ring, user_log, verbose))
+            .context("spawn log-tailer thread")?;
 
         Ok(())
     }
 
-    fn remove_tmp_config(&mut self) {
-        if let Some(p) = self.tmp_config.take() {
-            let _ = std::fs::remove_file(p);
+    fn cleanup(&mut self) {
+        if let Some(p) = self.tmp_config.take() { let _ = std::fs::remove_file(p); }
+        // Keep tmp_log alive for post-mortem; remove only if no user log requested
+        if self.log_file.is_none() {
+            if let Some(p) = self.tmp_log.take() { let _ = std::fs::remove_file(p); }
         }
     }
 }
 
 impl Drop for OpenVpnProcess {
     fn drop(&mut self) {
-        if self.child.is_some() {
-            self.force_disconnect();
-        }
+        if self.child.is_some() { self.force_disconnect(); }
     }
 }
 
-// ─── Config generation ────────────────────────────────────────────────────────
+// ─── Log tailer (standalone fn so the thread closure is small) ───────────────
 
-/// Write a minimal, correct OpenVPN config to a temp file.
-/// Notably absent: `persist-tun` – that directive keeps the kernel interface
-/// alive after the process dies, orphaning routes that block all traffic.
-fn write_temp_config(
-    host:  &str,
-    port:  u16,
-    proto: &str,
-    dns:   &[String],
-) -> Result<PathBuf> {
+fn tail_log(
+    log_path:   PathBuf,
+    connected:  Arc<Mutex<bool>>,
+    fail_reason: Arc<Mutex<Option<String>>>,
+    ring:       LogBuf,
+    user_log:   Option<PathBuf>,
+    verbose:    bool,
+) {
+    // Wait for openvpn to create / populate the log file (up to 5 s)
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if log_path.metadata().map(|m| m.len() > 0).unwrap_or(false) { break; }
+        if Instant::now() >= deadline {
+            let msg = "ERROR: openvpn log file empty after 5 s — binary may not exist or crashed \
+                 immediately. Check: which openvpn  or  ls /usr/sbin/openvpn".to_string();
+            log_push(&ring, &msg);
+            if verbose { eprintln!("{msg}"); }
+            *fail_reason.lock().unwrap() = Some("openvpn did not start".into());
+            return;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    // Open user passthrough sink
+    let mut user_sink: Option<std::fs::File> = user_log.as_ref().and_then(|p| {
+        std::fs::OpenOptions::new().create(true).append(true).open(p).ok()
+    });
+
+    let file = match std::fs::File::open(&log_path) {
+        Ok(f) => f,
+        Err(e) => {
+            log_push(&ring, format!("ERROR: open openvpn log: {e}"));
+            return;
+        }
+    };
+    let mut reader = BufReader::new(file);
+
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => {
+                // No new data yet — sleep and retry
+                thread::sleep(Duration::from_millis(80));
+                continue;
+            }
+            Err(_) => break,
+            Ok(_)  => {}
+        }
+
+        let line = line.trim().to_string();
+        if line.is_empty() { continue; }
+
+        let entry = format!("openvpn  {line}");
+        log_push(&ring, &entry);
+        if verbose { println!("{entry}"); }
+
+        if let Some(ref mut f) = user_sink {
+            use std::io::Write;
+            let _ = writeln!(f, "{entry}");
+        }
+
+        // ── State transitions ────────────────────────────────────────────────
+        if line.contains("Initialization Sequence Completed") {
+            *connected.lock().unwrap() = true;
+
+        } else if line.contains("AUTH_FAILED") || line.contains("auth-failure") {
+            *fail_reason.lock().unwrap() = Some(format!("authentication failed: {line}"));
+
+        } else if line.contains("TLS Error") || line.contains("TLS_ERROR") {
+            *fail_reason.lock().unwrap() = Some(format!("TLS error: {line}"));
+
+        } else if line.contains("Cannot resolve host address") || line.contains("getaddrinfo") {
+            *fail_reason.lock().unwrap() = Some(format!("DNS resolution failed: {line}"));
+
+        } else if line.contains("Connection refused") || line.contains("ECONNREFUSED") {
+            *fail_reason.lock().unwrap() = Some(format!("connection refused: {line}"));
+
+        } else if line.contains("process exiting") || line.contains("SIGTERM received") {
+            *connected.lock().unwrap() = false;
+        }
+    }
+
+    *connected.lock().unwrap() = false;
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Find the openvpn binary, checking sbin paths that sudo strips from PATH.
+fn resolve_openvpn_bin() -> String {
+    let candidates = [
+        "/usr/sbin/openvpn",
+        "/usr/local/sbin/openvpn",
+        "/sbin/openvpn",
+        "openvpn",
+    ];
+    for c in candidates {
+        if c.starts_with('/') {
+            if std::path::Path::new(c).exists() { return c.to_string(); }
+        } else {
+            // Search $PATH
+            if std::env::var("PATH").unwrap_or_default()
+                .split(':')
+                .any(|d| std::path::Path::new(d).join(c).exists())
+            {
+                return c.to_string();
+            }
+        }
+    }
+    // Last resort — just try "openvpn" and let the OS error if absent
+    "openvpn".to_string()
+}
+
+/// True if the profile connects over TCP (top-level `proto` or a per-`remote` proto).
+fn config_uses_tcp(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else { return false };
+    text.lines().map(str::trim).any(|t| {
+        (t.starts_with("proto ") && t.contains("tcp"))
+            || (t.starts_with("remote ")
+                && t.split_whitespace().nth(3).is_some_and(|p| p.contains("tcp")))
+    })
+}
+
+/// Write a minimal in-house .ovpn config for --host mode (no `daemon`, no `persist-tun`).
+fn write_minimal_config(host: &str, port: u16, proto: &str, dns: &[String]) -> Result<PathBuf> {
     use std::io::Write;
-
-    let primary   = dns.first().map(|s| s.as_str()).unwrap_or("1.1.1.1");
-    let secondary = dns.get(1).map(|s| s.as_str()).unwrap_or(primary);
-
+    let p1 = dns.first().map(|s| s.as_str()).unwrap_or("1.1.1.1");
+    let p2 = dns.get(1).map(|s| s.as_str()).unwrap_or(p1);
+    // fast-io is UDP-only; sndbuf/rcvbuf 0 = kernel-autotuned buffers
+    let fast_io = if proto.contains("udp") { "fast-io\n" } else { "" };
     let content = format!(
-        "client\n\
-         dev tun\n\
-         proto {proto}\n\
-         remote {host} {port}\n\
-         resolv-retry infinite\n\
-         nobind\n\
-         persist-key\n\
-         remote-cert-tls server\n\
-         cipher AES-256-GCM\n\
-         auth SHA256\n\
-         verb 3\n\
-         mute 20\n\
-         auth-user-pass\n\
-         redirect-gateway def1\n\
-         block-outside-dns\n\
-         dhcp-option DNS {primary}\n\
-         dhcp-option DNS {secondary}\n\
-         sndbuf 393216\n\
-         rcvbuf 393216\n\
-         fast-io\n\
-         keepalive 10 30\n"
+        "client\ndev tun\nproto {proto}\nremote {host} {port}\n\
+         resolv-retry infinite\nnobind\npersist-key\n\
+         remote-cert-tls server\ncipher AES-256-GCM\nauth SHA256\n\
+         verb 3\nmute 20\nauth-user-pass\nredirect-gateway def1\n\
+         block-outside-dns\ndhcp-option DNS {p1}\ndhcp-option DNS {p2}\n\
+         sndbuf 0\nrcvbuf 0\n{fast_io}keepalive 10 30\n"
     );
-
-    let mut f = tempfile::Builder::new()
-        .suffix(".ovpn")
-        .tempfile()
-        .context("create temp config")?;
+    let path = std::env::temp_dir().join(format!("vpnmgr-gen-{}.ovpn", std::process::id()));
+    let mut f = std::fs::File::create(&path).context("create generated config")?;
     f.write_all(content.as_bytes())?;
-    let (_, path) = f.keep().context("keep temp config")?;
     Ok(path)
 }
 
-// ─── Helper ───────────────────────────────────────────────────────────────────
-
-fn push_log(log: &LogBuf, msg: &str) {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let h = (secs % 86400) / 3600;
-    let m = (secs % 3600) / 60;
-    let s =  secs % 60;
-    let ts = format!("{h:02}:{m:02}:{s:02}");
-
-    let mut buf = log.lock().unwrap();
-    if buf.len() >= 4096 { buf.pop_front(); }
-    buf.push_back(format!("[{ts}] {msg}"));
-}
